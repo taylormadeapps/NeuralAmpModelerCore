@@ -11,6 +11,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <Eigen/Dense>
 
 #include "json.hpp"
@@ -184,10 +188,13 @@ class ActivationTanh : public Activation
 public:
   void apply(float* data, long size) override
   {
+#if defined(__APPLE__)
+    int n = (int)size;
+    vvtanhf(data, data, &n);
+#else
     for (long pos = 0; pos < size; pos++)
-    {
       data[pos] = std::tanh(data[pos]);
-    }
+#endif
   }
 };
 
@@ -196,10 +203,13 @@ class ActivationHardTanh : public Activation
 public:
   void apply(float* data, long size) override
   {
+#if defined(__APPLE__)
+    float lo = -1.0f, hi = 1.0f;
+    vDSP_vclip(data, 1, &lo, &hi, data, 1, (vDSP_Length)size);
+#else
     for (long pos = 0; pos < size; pos++)
-    {
       data[pos] = hard_tanh(data[pos]);
-    }
+#endif
   }
 };
 
@@ -234,10 +244,14 @@ class ActivationFastTanh : public Activation
 public:
   void apply(float* data, long size) override
   {
+#if defined(__APPLE__)
+    // vvtanhf is faster than the polynomial approximation on Apple Silicon.
+    int n = (int)size;
+    vvtanhf(data, data, &n);
+#else
     for (long pos = 0; pos < size; pos++)
-    {
       data[pos] = fast_tanh(data[pos]);
-    }
+#endif
   }
 };
 
@@ -246,8 +260,13 @@ class ActivationReLU : public Activation
 public:
   void apply(float* data, long size) override
   {
+#if defined(__APPLE__)
+    float zero = 0.0f;
+    vDSP_vthres(data, 1, &zero, data, 1, (vDSP_Length)size);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = relu(data[pos]);
+#endif
   }
 };
 
@@ -336,8 +355,22 @@ class ActivationSigmoid : public Activation
 public:
   void apply(float* data, long size) override
   {
+#if defined(__APPLE__)
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    // Step 1: negate in-place
+    vDSP_vneg(data, 1, data, 1, (vDSP_Length)size);
+    // Step 2: vectorised exp
+    int n = (int)size;
+    vvexpf(data, data, &n);
+    // Step 3: add 1
+    float one = 1.0f;
+    vDSP_vsadd(data, 1, &one, data, 1, (vDSP_Length)size);
+    // Step 4: reciprocal (1 / (1 + exp(-x)))
+    vvrecf(data, data, &n);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = sigmoid(data[pos]);
+#endif
   }
 };
 
@@ -346,9 +379,30 @@ class ActivationSwish : public Activation
 public:
   void apply(float* data, long size) override
   {
+#if defined(__APPLE__)
+    // swish(x) = x * sigmoid(x)
+    // Compute sigmoid into scratch, then element-wise multiply.
+    _scratch.resize((size_t)size);
+    float* sig = _scratch.data();
+    // sigmoid: negate → exp → add 1 → reciprocal
+    vDSP_vneg(data, 1, sig, 1, (vDSP_Length)size);
+    int n = (int)size;
+    vvexpf(sig, sig, &n);
+    float one = 1.0f;
+    vDSP_vsadd(sig, 1, &one, sig, 1, (vDSP_Length)size);
+    vvrecf(sig, sig, &n);
+    // data[i] = data[i] * sig[i]
+    vDSP_vmul(data, 1, sig, 1, data, 1, (vDSP_Length)size);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = swish(data[pos]);
+#endif
   }
+
+private:
+#if defined(__APPLE__)
+  std::vector<float> _scratch;
+#endif
 };
 
 class ActivationHardSwish : public Activation
@@ -356,9 +410,31 @@ class ActivationHardSwish : public Activation
 public:
   void apply(float* data, long size) override
   {
+#if defined(__APPLE__)
+    // hardswish(x) = x * clamp(x + 3, 0, 6) / 6
+    _scratch.resize((size_t)size);
+    float* tmp = _scratch.data();
+    // tmp = data + 3
+    float three = 3.0f;
+    vDSP_vsadd(data, 1, &three, tmp, 1, (vDSP_Length)size);
+    // clamp to [0, 6]
+    float lo = 0.0f, hi = 6.0f;
+    vDSP_vclip(tmp, 1, &lo, &hi, tmp, 1, (vDSP_Length)size);
+    // tmp = tmp / 6
+    float sixth = 1.0f / 6.0f;
+    vDSP_vsmul(tmp, 1, &sixth, tmp, 1, (vDSP_Length)size);
+    // data = data * tmp
+    vDSP_vmul(data, 1, tmp, 1, data, 1, (vDSP_Length)size);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = hardswish(data[pos]);
+#endif
   }
+
+private:
+#if defined(__APPLE__)
+  std::vector<float> _scratch;
+#endif
 };
 
 class ActivationSoftsign : public Activation

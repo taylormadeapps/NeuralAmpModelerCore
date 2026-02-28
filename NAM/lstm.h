@@ -60,6 +60,11 @@ public:
     return state._xh(Eigen::placeholders::lastN(this->_get_hidden_size()));
   }
 
+  /// \brief Batched processing: N channels' _xh vectors → one GEMM → per-channel gate updates.
+  /// batch_xh and batch_ifgo must be pre-allocated to at least (rows × N) columns.
+  void processBatch_(Eigen::MatrixXf& batch_xh, Eigen::MatrixXf& batch_ifgo,
+                     LSTMCellState** states, int N) const;
+
 private:
   // Parameters
   // xh -> ifgo
@@ -82,6 +87,9 @@ private:
 
   long _get_hidden_size() const { return this->_b.size() / 4; };
   long _get_input_size() const { return this->_xh.size() - this->_get_hidden_size(); };
+
+  // Allow LSTM to access _w dimensions for batch scratch allocation.
+  friend class LSTM;
 };
 
 /// \brief Mutable per-channel state for a complete LSTM model.
@@ -136,6 +144,9 @@ public:
   std::unique_ptr<ChannelState> createChannelState() const override;
   void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
   void prewarmChannelState(ChannelState& state) override;
+  void processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                            int numFrames, ChannelState** states, int numChannels) override;
+  void prepareBatch(int maxBatchSize) override;
 
 protected:
   // Hacky, but a half-second seems to work for most models.
@@ -153,6 +164,18 @@ protected:
   Eigen::VectorXf _input;
   // Output from _process_sample - multi-channel output vector (size out_channels)
   Eigen::VectorXf _output;
+
+  // Batch scratch matrices for N-channel processing (pre-allocated on message thread).
+  // Per-layer: one pair of (xh, ifgo) matrices sized for the layer's dimensions.
+  struct BatchLayerScratch
+  {
+    Eigen::MatrixXf xh;    // (dx+dh × max_batch)
+    Eigen::MatrixXf ifgo;  // (4*dh × max_batch)
+  };
+  std::vector<BatchLayerScratch> _batch_layer_scratch;
+  Eigen::MatrixXf _batch_hidden;  // (dh × max_batch) — last layer hidden states
+  Eigen::MatrixXf _batch_output;  // (out_ch × max_batch) — head projection result
+  int _max_batch_size = 0;
 };
 
 /// \brief Configuration for an LSTM model

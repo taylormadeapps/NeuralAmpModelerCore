@@ -104,6 +104,23 @@ public:
   /// \param state Per-channel state to prewarm
   virtual void prewarmChannelState(ChannelState& state);
 
+  /// \brief Process N mono channels simultaneously through shared weights.
+  ///
+  /// Default implementation: sequential processChannel() loop.
+  /// Architecture subclasses (LSTM) override with batched GEMM for N > 2.
+  /// \param monoInputs  monoInputs[ch]  = input samples for channel ch
+  /// \param monoOutputs monoOutputs[ch] = output samples for channel ch
+  /// \param numFrames   Number of audio frames to process
+  /// \param states      Per-channel state pointers (size numChannels)
+  /// \param numChannels Number of channels to process
+  virtual void processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                                    int numFrames, ChannelState** states, int numChannels);
+
+  /// \brief Pre-allocate batch scratch buffers for N-channel processing.
+  /// Called on message thread when channel count changes.
+  /// Default: no-op. LSTM overrides to allocate batch matrices.
+  virtual void prepareBatch(int maxBatchSize);
+
   /// \brief Get the expected sample rate
   /// \return Expected sample rate in Hz (-1.0 if unknown)
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };

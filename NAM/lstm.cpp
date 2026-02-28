@@ -3,6 +3,10 @@
 #include <vector>
 #include <memory>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include "registry.h"
 #include "lstm.h"
 
@@ -117,6 +121,75 @@ void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x, LSTMCellState& stat
 
     for (int i = 0; i < hidden_size; i++)
       state._xh[i + h_offset] = activations::sigmoid(state._ifgo[i + o_offset]) * tanhf(state._c[i]);
+  }
+}
+
+// --- LSTMCell batched processing (N channels, one GEMM) ---------------------
+
+void nam::lstm::LSTMCell::processBatch_(Eigen::MatrixXf& batch_xh, Eigen::MatrixXf& batch_ifgo,
+                                         LSTMCellState** states, int N) const
+{
+  const long hs = this->_get_hidden_size();
+  const long is = this->_get_input_size();
+
+  // 1. Stack N _xh vectors as columns into batch_xh.
+  for (int ch = 0; ch < N; ++ch)
+    batch_xh.col(ch) = states[ch]->_xh;
+
+  // 2. Batched GEMM: batch_ifgo = _w * batch_xh + _b (broadcast).
+  //    Pre-fill with bias, then GEMM adds the product.
+  batch_ifgo.leftCols(N).colwise() = this->_b;
+
+#if defined(__APPLE__)
+  cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+              (int)this->_w.rows(), N, (int)this->_w.cols(),
+              1.0f,
+              this->_w.data(), (int)this->_w.rows(),
+              batch_xh.data(), (int)batch_xh.rows(),
+              1.0f,  // beta=1.0: adds to pre-filled bias
+              batch_ifgo.data(), (int)batch_ifgo.rows());
+#else
+  batch_ifgo.leftCols(N).noalias() += this->_w * batch_xh.leftCols(N);
+#endif
+
+  // 3. Per-channel gate updates (elementwise — _c is channel-specific).
+  const long i_offset = 0;
+  const long f_offset = hs;
+  const long g_offset = 2 * hs;
+  const long o_offset = 3 * hs;
+  const long h_offset = is;
+
+  if (activations::Activation::using_fast_tanh)
+  {
+    for (int ch = 0; ch < N; ++ch)
+    {
+      auto& st = *states[ch];
+      const float* ifgo = batch_ifgo.col(ch).data();
+
+      for (long i = 0; i < hs; i++)
+        st._c[i] =
+          activations::fast_sigmoid(ifgo[f_offset + i]) * st._c[i]
+          + activations::fast_sigmoid(ifgo[i_offset + i]) * activations::fast_tanh(ifgo[g_offset + i]);
+
+      for (long i = 0; i < hs; i++)
+        st._xh[h_offset + i] =
+          activations::fast_sigmoid(ifgo[o_offset + i]) * activations::fast_tanh(st._c[i]);
+    }
+  }
+  else
+  {
+    for (int ch = 0; ch < N; ++ch)
+    {
+      auto& st = *states[ch];
+      const float* ifgo = batch_ifgo.col(ch).data();
+
+      for (long i = 0; i < hs; i++)
+        st._c[i] = activations::sigmoid(ifgo[f_offset + i]) * st._c[i]
+                    + activations::sigmoid(ifgo[i_offset + i]) * tanhf(ifgo[g_offset + i]);
+
+      for (long i = 0; i < hs; i++)
+        st._xh[h_offset + i] = activations::sigmoid(ifgo[o_offset + i]) * tanhf(st._c[i]);
+    }
   }
 }
 
@@ -325,6 +398,165 @@ void nam::lstm::LSTM::prewarmChannelState(ChannelState& state)
 {
   auto& lstmState = static_cast<LSTMChannelState&>(state);
   prewarmTypedChannelState(lstmState);
+}
+
+// --- Batched multi-channel processing ----------------------------------------
+
+void nam::lstm::LSTM::prepareBatch(int maxBatchSize)
+{
+  if (maxBatchSize <= 0)
+    return;
+  _max_batch_size = maxBatchSize;
+
+  // Allocate per-layer batch scratch matrices.
+  _batch_layer_scratch.resize(this->_layers.size());
+  for (size_t l = 0; l < this->_layers.size(); l++)
+  {
+    // _w is (4*dh × (dx+dh)) — use friend access to get dimensions.
+    const int xh_rows = (int)this->_layers[l]._w.cols();   // dx + dh
+    const int ifgo_rows = (int)this->_layers[l]._w.rows();  // 4 * dh
+
+    _batch_layer_scratch[l].xh.resize(xh_rows, maxBatchSize);
+    _batch_layer_scratch[l].ifgo.resize(ifgo_rows, maxBatchSize);
+  }
+
+  // Head projection scratch: hidden_size from last layer.
+  if (!this->_layers.empty())
+  {
+    const int hidden_size = (int)this->_layers.back()._get_hidden_size();
+    _batch_hidden.resize(hidden_size, maxBatchSize);
+  }
+  _batch_output.resize(this->_head_weight.rows(), maxBatchSize);
+}
+
+void nam::lstm::LSTM::processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                                            int numFrames, ChannelState** states, int numChannels)
+{
+  // Fallback to sequential for small batch sizes or if batch scratch not allocated.
+  if (numChannels <= 2 || _max_batch_size < numChannels)
+  {
+    DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+    return;
+  }
+
+  const int N = numChannels;
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+  const int numLayers = (int)this->_layers.size();
+
+  // Collect typed state pointers.
+  // Use a small stack array for typical sizes, heap-allocate for large N.
+  LSTMChannelState* lstmStates[64];
+  std::vector<LSTMChannelState*> lstmStatesHeap;
+  LSTMChannelState** sp;
+  if (N <= 64)
+  {
+    sp = lstmStates;
+  }
+  else
+  {
+    lstmStatesHeap.resize(N);
+    sp = lstmStatesHeap.data();
+  }
+  for (int ch = 0; ch < N; ++ch)
+    sp[ch] = static_cast<LSTMChannelState*>(states[ch]);
+
+  // Per-layer cell state pointers (reused each sample).
+  LSTMCellState* cellStates[64];
+  std::vector<LSTMCellState*> cellStatesHeap;
+  LSTMCellState** cp;
+  if (N <= 64)
+    cp = cellStates;
+  else
+  {
+    cellStatesHeap.resize(N);
+    cp = cellStatesHeap.data();
+  }
+
+  // Process frame by frame — LSTM is per-sample recurrent.
+  for (int f = 0; f < numFrames; ++f)
+  {
+    // 1. Set each channel's input from the mono buffers.
+    for (int ch = 0; ch < N; ++ch)
+    {
+      for (int c = 0; c < in_channels; ++c)
+        sp[ch]->_input(c) = monoInputs[ch][f];
+    }
+
+    if (numLayers == 0)
+    {
+      // No layers — pass input to output.
+      for (int ch = 0; ch < N; ++ch)
+      {
+        const int toCopy = std::min(in_channels, out_channels);
+        for (int c = 0; c < toCopy; ++c)
+          sp[ch]->_output(c) = sp[ch]->_input(c);
+        for (int c = toCopy; c < out_channels; ++c)
+          sp[ch]->_output(c) = 0.0f;
+      }
+    }
+    else
+    {
+      // --- Layer 0: input is the model input ---
+      for (int ch = 0; ch < N; ++ch)
+      {
+        auto& ls = sp[ch]->layers[0];
+        // Write input into _xh (first `input_size` elements).
+        ls._xh.head(sp[ch]->_input.size()) = sp[ch]->_input;
+        cp[ch] = &ls;
+      }
+      this->_layers[0].processBatch_(
+          _batch_layer_scratch[0].xh, _batch_layer_scratch[0].ifgo, cp, N);
+
+      // --- Subsequent layers: input is previous layer's hidden state ---
+      for (int l = 1; l < numLayers; ++l)
+      {
+        for (int ch = 0; ch < N; ++ch)
+        {
+          // Get hidden state from previous layer.
+          const Eigen::VectorXf h = this->_layers[l - 1].get_hidden_state(sp[ch]->layers[l - 1]);
+          // Write into this layer's _xh.
+          sp[ch]->layers[l]._xh.head(h.size()) = h;
+          cp[ch] = &sp[ch]->layers[l];
+        }
+        this->_layers[l].processBatch_(
+            _batch_layer_scratch[l].xh, _batch_layer_scratch[l].ifgo, cp, N);
+      }
+
+      // --- Head projection: batched across all N channels ---
+      // Stack hidden states from last layer.
+      for (int ch = 0; ch < N; ++ch)
+      {
+        _batch_hidden.col(ch) =
+            this->_layers[numLayers - 1].get_hidden_state(sp[ch]->layers[numLayers - 1]);
+      }
+
+      // batch_output = _head_weight * batch_hidden + _head_bias (broadcast)
+      _batch_output.leftCols(N).colwise() = this->_head_bias;
+#if defined(__APPLE__)
+      cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                  (int)this->_head_weight.rows(), N, (int)this->_head_weight.cols(),
+                  1.0f,
+                  this->_head_weight.data(), (int)this->_head_weight.rows(),
+                  _batch_hidden.data(), (int)_batch_hidden.rows(),
+                  1.0f,
+                  _batch_output.data(), (int)_batch_output.rows());
+#else
+      _batch_output.leftCols(N).noalias() += this->_head_weight * _batch_hidden.leftCols(N);
+#endif
+
+      // Scatter outputs back to per-channel state.
+      for (int ch = 0; ch < N; ++ch)
+        sp[ch]->_output = _batch_output.col(ch);
+    }
+
+    // 2. Copy per-channel output to the mono output buffers.
+    for (int ch = 0; ch < N; ++ch)
+    {
+      for (int c = 0; c < out_channels; ++c)
+        monoOutputs[ch][f] = sp[ch]->_output(c);
+    }
+  }
 }
 
 // Config parser

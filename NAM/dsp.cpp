@@ -100,6 +100,28 @@ void nam::DSP::prewarmChannelState(ChannelState& /*state*/)
   prewarm();
 }
 
+void nam::DSP::processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                                    int numFrames, ChannelState** states, int numChannels)
+{
+  // Default: sequential processChannel() loop.
+  // Architecture subclasses (LSTM) override with batched GEMM.
+  float* inPtrs[1];
+  float* outPtrs[1];
+  for (int ch = 0; ch < numChannels; ++ch)
+  {
+    if (states[ch] == nullptr)
+      continue;
+    inPtrs[0]  = monoInputs[ch];
+    outPtrs[0] = monoOutputs[ch];
+    processChannel(inPtrs, outPtrs, numFrames, *states[ch]);
+  }
+}
+
+void nam::DSP::prepareBatch(int /*maxBatchSize*/)
+{
+  // Default: no-op. LSTM overrides to allocate batch matrices.
+}
+
 double nam::DSP::GetLoudness() const
 {
   if (!HasLoudness())
