@@ -81,6 +81,25 @@ void nam::DSP::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_fr
   }
 }
 
+// --- Shared-weight multi-channel API (default no-ops) -----------------------
+
+std::unique_ptr<nam::ChannelState> nam::DSP::createChannelState() const
+{
+  return nullptr;
+}
+
+void nam::DSP::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& /*state*/)
+{
+  // Default: ignore state, use internal state (backwards compatible).
+  process(input, output, num_frames);
+}
+
+void nam::DSP::prewarmChannelState(ChannelState& /*state*/)
+{
+  // Default: prewarm internal state (no multi-channel support).
+  prewarm();
+}
+
 double nam::DSP::GetLoudness() const
 {
   if (!HasLoudness())

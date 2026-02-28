@@ -18,6 +18,23 @@ namespace nam
 {
 namespace convnet
 {
+
+// =============================================================================
+// Per-channel state structs — separated from weights for shared-weight
+// multi-channel processing. One state per audio channel; the ConvNet class
+// holds the shared (immutable after load) weight matrices.
+// =============================================================================
+
+/// \brief Mutable per-channel state for a ConvNet model.
+///
+/// Contains Conv1D ring buffers (one per ConvNetBlock) and the Buffer base
+/// class input history. Swapped in/out of the ConvNet engine for each channel.
+struct ConvNetChannelState : public ChannelState
+{
+  std::vector<RingBuffer> conv_ring_buffers; ///< One per ConvNetBlock
+  std::vector<std::vector<float>> input_buffers; ///< From Buffer base class
+  long input_buffer_offset = 0; ///< Current write position in input_buffers
+};
 /// \brief Batch normalization layer
 ///
 /// In production mode, so really just an elementwise affine layer.
@@ -150,6 +167,22 @@ public:
   /// \brief Resize all buffers to handle maxBufferSize frames
   /// \param maxBufferSize Maximum number of frames to process in a single call
   void SetMaxBufferSize(const int maxBufferSize) override;
+
+  // --- Shared-weight multi-channel API ----------------------------------------
+
+  /// \brief Create a fresh per-channel state (Conv1D ring buffers + Buffer input history).
+  ConvNetChannelState createTypedChannelState() const;
+
+  /// \brief Swap channel state in/out of the engine (O(1) pointer swaps).
+  void swapChannelState(ConvNetChannelState& state);
+
+  /// \brief Prewarm an external channel state by processing silence.
+  void prewarmTypedChannelState(ConvNetChannelState& state);
+
+  // --- DSP virtual interface overrides ----------------------------------------
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
 
 protected:
   std::vector<ConvNetBlock> _blocks;

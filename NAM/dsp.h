@@ -23,6 +23,18 @@
 
 namespace nam
 {
+
+/// \brief Base class for per-channel mutable state.
+///
+/// Each NAM architecture defines a concrete subclass holding its per-channel
+/// state (ring buffers, hidden state, etc.). NamProcessor holds a
+/// vector<unique_ptr<ChannelState>> and passes them through the DSP virtual
+/// interface, enabling shared weights across N audio channels.
+struct ChannelState
+{
+  virtual ~ChannelState() = default;
+};
+
 namespace wavenet
 {
 /// Forward declaration to allow WaveNet to access protected members of DSP
@@ -69,6 +81,29 @@ public:
   /// \param output Output audio buffers. Same structure as input.
   /// \param num_frames Number of frames to process
   virtual void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames);
+  // --- Shared-weight multi-channel API ----------------------------------------
+  // Override these in architecture subclasses to support shared weights
+  // across N audio channels. Default implementations return nullptr / no-op.
+
+  /// \brief Create a fresh per-channel state for this model.
+  /// \return Unique pointer to a ChannelState, or nullptr if not supported.
+  virtual std::unique_ptr<ChannelState> createChannelState() const;
+
+  /// \brief Process one channel using shared weights and external state.
+  ///
+  /// For swap-based architectures (WaveNet, ConvNet), this swaps state in,
+  /// calls process(), and swaps state back. For LSTM, this uses the const
+  /// process overload with shared weights.
+  /// \param input Input audio buffers
+  /// \param output Output audio buffers
+  /// \param num_frames Number of frames to process
+  /// \param state Per-channel state (must match the type from createChannelState)
+  virtual void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state);
+
+  /// \brief Prewarm an external channel state by processing silence.
+  /// \param state Per-channel state to prewarm
+  virtual void prewarmChannelState(ChannelState& state);
+
   /// \brief Get the expected sample rate
   /// \return Expected sample rate in Hz (-1.0 if unknown)
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };

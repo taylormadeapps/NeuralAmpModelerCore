@@ -37,6 +37,26 @@ inline GatingMode gating_mode_from_bool(bool gated)
   return gated ? GatingMode::GATED : GatingMode::NONE;
 }
 
+// =============================================================================
+// Per-channel state structs for shared-weight multi-channel processing.
+// Only Conv1D ring buffers carry state between audio blocks — all other
+// buffers are scratch (recomputed each Process() call).
+// The swap pattern: swap ring buffers in before processing, swap back after.
+// Process() code is completely unchanged.
+// =============================================================================
+
+/// \brief Per-channel state for one _LayerArray (ring buffers for each layer's Conv1D).
+struct WaveNetLayerArrayState
+{
+  std::vector<RingBuffer> conv_ring_buffers; ///< One per _Layer
+};
+
+/// \brief Per-channel state for the entire WaveNet.
+struct WaveNetChannelState : public ChannelState
+{
+  std::vector<WaveNetLayerArrayState> layer_array_states;
+};
+
 /// \brief Parameters for head1x1 configuration
 ///
 /// Configures an optional 1x1 convolution that outputs directly to the head (skip connection)
@@ -376,6 +396,10 @@ public:
   /// \return Const reference to the internal Conv1D object
   const Conv1D& get_conv() const { return _conv; }
 
+  // --- Shared-weight multi-channel API ----------------------------------------
+  RingBuffer createFreshConvRingBuffer() const { return _conv.createFreshRingBuffer(); }
+  void swapConvRingBuffer(RingBuffer& other) { _conv.swapRingBuffer(other); }
+
 private:
   // The dilated convolution at the front of the block
   Conv1D _conv;
@@ -600,6 +624,10 @@ public:
   /// \return Receptive field size
   long get_receptive_field() const;
 
+  // --- Shared-weight multi-channel API ----------------------------------------
+  WaveNetLayerArrayState createState() const;
+  void swapState(WaveNetLayerArrayState& state);
+
 private:
   // The rechannel before the layers
   Conv1x1 _rechannel;
@@ -660,6 +688,23 @@ public:
   /// \param output Output audio buffers (out_channels x frames)
   /// \param num_frames Number of frames to process
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
+
+  // --- Shared-weight multi-channel API ----------------------------------------
+
+  /// \brief Create a fresh channel state (ring buffers for all Conv1D layers).
+  WaveNetChannelState createTypedChannelState() const;
+
+  /// \brief Swap all internal ring buffers with the given channel state (O(1) per buffer).
+  /// Call before process() to load a channel, call again after to save it back.
+  void swapChannelState(WaveNetChannelState& state);
+
+  /// \brief Prewarm an external channel state by processing silence.
+  void prewarmTypedChannelState(WaveNetChannelState& state);
+
+  // --- DSP virtual interface overrides ----------------------------------------
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
 
   /// \brief Set model weights from a vector
   /// \param weights Vector containing all model weights

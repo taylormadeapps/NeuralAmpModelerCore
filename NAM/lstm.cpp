@@ -26,6 +26,13 @@ nam::lstm::LSTMCell::LSTMCell(const int input_size, const int hidden_size, std::
     this->_xh[i + h_offset] = *(weights++);
   for (int i = 0; i < hidden_size; i++)
     this->_c[i] = *(weights++);
+
+  // Save initial state templates for multi-channel cloning.
+  // Zero the input portion (only hidden portion was loaded from weights).
+  for (int i = 0; i < input_size; i++)
+    this->_xh[i] = 0.0f;
+  this->_initial_xh = this->_xh;
+  this->_initial_c = this->_c;
 }
 
 void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x)
@@ -62,6 +69,54 @@ void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x)
 
     for (int i = 0; i < hidden_size; i++)
       this->_xh[i + h_offset] = activations::sigmoid(this->_ifgo[i + o_offset]) * tanhf(this->_c[i]);
+  }
+}
+
+// --- LSTMCell shared-weight multi-channel API --------------------------------
+
+nam::lstm::LSTMCellState nam::lstm::LSTMCell::createState() const
+{
+  LSTMCellState state;
+  state._xh = this->_initial_xh;
+  state._ifgo.resize(this->_ifgo.size());
+  state._c = this->_initial_c;
+  return state;
+}
+
+void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x, LSTMCellState& state) const
+{
+  const long hidden_size = this->_get_hidden_size();
+  const long input_size = this->_get_input_size();
+  // Assign inputs
+  state._xh(Eigen::seq(0, input_size - 1)) = x;
+  // The matmul — shared weights, external state
+  state._ifgo = this->_w * state._xh + this->_b;
+  // Elementwise updates (apply nonlinearities)
+  const long i_offset = 0;
+  const long f_offset = hidden_size;
+  const long g_offset = 2 * hidden_size;
+  const long o_offset = 3 * hidden_size;
+  const long h_offset = input_size;
+
+  if (activations::Activation::using_fast_tanh)
+  {
+    for (auto i = 0; i < hidden_size; i++)
+      state._c[i] =
+        activations::fast_sigmoid(state._ifgo[i + f_offset]) * state._c[i]
+        + activations::fast_sigmoid(state._ifgo[i + i_offset]) * activations::fast_tanh(state._ifgo[i + g_offset]);
+
+    for (int i = 0; i < hidden_size; i++)
+      state._xh[i + h_offset] =
+        activations::fast_sigmoid(state._ifgo[i + o_offset]) * activations::fast_tanh(state._c[i]);
+  }
+  else
+  {
+    for (auto i = 0; i < hidden_size; i++)
+      state._c[i] = activations::sigmoid(state._ifgo[i + f_offset]) * state._c[i]
+                    + activations::sigmoid(state._ifgo[i + i_offset]) * tanhf(state._ifgo[i + g_offset]);
+
+    for (int i = 0; i < hidden_size; i++)
+      state._xh[i + h_offset] = activations::sigmoid(state._ifgo[i + o_offset]) * tanhf(state._c[i]);
   }
 }
 
@@ -161,6 +216,115 @@ void nam::lstm::LSTM::_process_sample()
 
   // Add bias: (out_channels) += (out_channels)
   this->_output.noalias() += this->_head_bias;
+}
+
+// --- LSTM shared-weight multi-channel API ------------------------------------
+
+nam::lstm::LSTMChannelState nam::lstm::LSTM::createTypedChannelState() const
+{
+  LSTMChannelState state;
+  state.layers.reserve(this->_layers.size());
+  for (const auto& layer : this->_layers)
+    state.layers.push_back(layer.createState());
+  state._input.resize(this->_input.size());
+  state._input.setZero();
+  state._output.resize(this->_output.size());
+  state._output.setZero();
+  return state;
+}
+
+void nam::lstm::LSTM::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                              LSTMChannelState& state) const
+{
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+
+  for (int i = 0; i < num_frames; i++)
+  {
+    for (int ch = 0; ch < in_channels; ch++)
+      state._input(ch) = input[ch][i];
+
+    this->_process_sample(state);
+
+    for (int ch = 0; ch < out_channels; ch++)
+      output[ch][i] = state._output(ch);
+  }
+}
+
+void nam::lstm::LSTM::_process_sample(LSTMChannelState& state) const
+{
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+
+  if (this->_layers.size() == 0)
+  {
+    const int channels_to_copy = std::min(in_channels, out_channels);
+    for (int ch = 0; ch < channels_to_copy; ch++)
+      state._output(ch) = state._input(ch);
+    for (int ch = channels_to_copy; ch < out_channels; ch++)
+      state._output(ch) = 0.0f;
+    return;
+  }
+
+  this->_layers[0].process_(state._input, state.layers[0]);
+  for (size_t i = 1; i < this->_layers.size(); i++)
+    this->_layers[i].process_(
+      this->_layers[i - 1].get_hidden_state(state.layers[i - 1]),
+      state.layers[i]);
+
+  const Eigen::VectorXf& hidden_state =
+    this->_layers[this->_layers.size() - 1].get_hidden_state(
+      state.layers[this->_layers.size() - 1]);
+
+  state._output.noalias() = this->_head_weight * hidden_state;
+  state._output.noalias() += this->_head_bias;
+}
+
+void nam::lstm::LSTM::prewarmTypedChannelState(LSTMChannelState& state) const
+{
+  const int prewarmSamples = (int)(0.5 * mExpectedSampleRate);
+  const int samples = prewarmSamples <= 0 ? 1 : prewarmSamples;
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+
+  // Allocate temporary silence buffers on the message thread
+  std::vector<std::vector<NAM_SAMPLE>> inputBuffers(in_channels);
+  std::vector<std::vector<NAM_SAMPLE>> outputBuffers(out_channels);
+  std::vector<NAM_SAMPLE*> inputPtrs(in_channels);
+  std::vector<NAM_SAMPLE*> outputPtrs(out_channels);
+
+  for (int ch = 0; ch < in_channels; ch++)
+  {
+    inputBuffers[ch].resize(samples, 0.0);
+    inputPtrs[ch] = inputBuffers[ch].data();
+  }
+  for (int ch = 0; ch < out_channels; ch++)
+  {
+    outputBuffers[ch].resize(samples, 0.0);
+    outputPtrs[ch] = outputBuffers[ch].data();
+  }
+
+  this->process(inputPtrs.data(), outputPtrs.data(), samples, state);
+}
+
+// --- DSP virtual interface overrides -----------------------------------------
+
+std::unique_ptr<nam::ChannelState> nam::lstm::LSTM::createChannelState() const
+{
+  return std::make_unique<LSTMChannelState>(createTypedChannelState());
+}
+
+void nam::lstm::LSTM::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                     ChannelState& state)
+{
+  auto& lstmState = static_cast<LSTMChannelState&>(state);
+  process(input, output, num_frames, lstmState);
+}
+
+void nam::lstm::LSTM::prewarmChannelState(ChannelState& state)
+{
+  auto& lstmState = static_cast<LSTMChannelState&>(state);
+  prewarmTypedChannelState(lstmState);
 }
 
 // Config parser

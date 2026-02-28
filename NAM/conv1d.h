@@ -117,6 +117,14 @@ public:
   /// \return true if bias is present, false otherwise
   bool has_bias() const { return this->_bias.size() > 0; };
 
+  // --- Shared-weight multi-channel API ----------------------------------------
+
+  /// \brief Create a fresh ring buffer configured identically to the internal one.
+  RingBuffer createFreshRingBuffer() const;
+
+  /// \brief Swap the internal ring buffer with an external one (O(1) pointer swap).
+  void swapRingBuffer(RingBuffer& other) { std::swap(_input_buffer, other); }
+
 protected:
   // conv[kernel](cout, cin) - used for non-depthwise convolutions
   std::vector<Eigen::MatrixXf> _weight;

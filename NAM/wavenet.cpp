@@ -641,6 +641,67 @@ void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
   }
 }
 
+// --- Shared-weight multi-channel API -----------------------------------------
+
+nam::wavenet::WaveNetLayerArrayState nam::wavenet::_LayerArray::createState() const
+{
+  WaveNetLayerArrayState state;
+  state.conv_ring_buffers.reserve(_layers.size());
+  for (const auto& layer : _layers)
+    state.conv_ring_buffers.push_back(layer.createFreshConvRingBuffer());
+  return state;
+}
+
+void nam::wavenet::_LayerArray::swapState(WaveNetLayerArrayState& state)
+{
+  for (size_t i = 0; i < _layers.size(); i++)
+    _layers[i].swapConvRingBuffer(state.conv_ring_buffers[i]);
+}
+
+nam::wavenet::WaveNetChannelState nam::wavenet::WaveNet::createTypedChannelState() const
+{
+  WaveNetChannelState state;
+  state.layer_array_states.reserve(_layer_arrays.size());
+  for (const auto& la : _layer_arrays)
+    state.layer_array_states.push_back(la.createState());
+  return state;
+}
+
+void nam::wavenet::WaveNet::swapChannelState(WaveNetChannelState& state)
+{
+  for (size_t i = 0; i < _layer_arrays.size(); i++)
+    _layer_arrays[i].swapState(state.layer_array_states[i]);
+}
+
+void nam::wavenet::WaveNet::prewarmTypedChannelState(WaveNetChannelState& state)
+{
+  swapChannelState(state);  // Load the channel state into the engine
+  prewarm();                // Process silence through PrewarmSamples()
+  swapChannelState(state);  // Save the warmed state back
+}
+
+// --- DSP virtual interface overrides -----------------------------------------
+
+std::unique_ptr<nam::ChannelState> nam::wavenet::WaveNet::createChannelState() const
+{
+  return std::make_unique<WaveNetChannelState>(createTypedChannelState());
+}
+
+void nam::wavenet::WaveNet::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                           ChannelState& state)
+{
+  auto& waveNetState = static_cast<WaveNetChannelState&>(state);
+  swapChannelState(waveNetState);
+  process(input, output, num_frames);
+  swapChannelState(waveNetState);
+}
+
+void nam::wavenet::WaveNet::prewarmChannelState(ChannelState& state)
+{
+  auto& waveNetState = static_cast<WaveNetChannelState&>(state);
+  prewarmTypedChannelState(waveNetState);
+}
+
 // Config parser - extracts all configuration from JSON without constructing the DSP
 nam::wavenet::WaveNetConfig nam::wavenet::parse_config_json(const nlohmann::json& config,
                                                             const double expectedSampleRate)

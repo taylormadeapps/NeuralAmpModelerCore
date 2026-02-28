@@ -13,6 +13,21 @@ namespace nam
 {
 namespace lstm
 {
+
+// =============================================================================
+// Per-channel state structs — separated from weights for shared-weight
+// multi-channel processing. One state per audio channel; the LSTMCell / LSTM
+// classes hold the shared (immutable after load) weight matrices.
+// =============================================================================
+
+/// \brief Mutable per-channel state for a single LSTM cell.
+struct LSTMCellState
+{
+  Eigen::VectorXf _xh;    ///< Concatenated input + hidden state
+  Eigen::VectorXf _ifgo;  ///< Gate activations (scratch — recomputed each sample)
+  Eigen::VectorXf _c;     ///< Cell state
+};
+
 /// \brief A single LSTM cell
 class LSTMCell
 {
@@ -31,6 +46,20 @@ public:
   /// \param x Input vector
   void process_(const Eigen::VectorXf& x);
 
+  // --- Shared-weight multi-channel API ----------------------------------------
+
+  /// \brief Create a fresh per-channel state from initial conditions.
+  LSTMCellState createState() const;
+
+  /// \brief Process using shared weights (this) and external per-channel state.
+  void process_(const Eigen::VectorXf& x, LSTMCellState& state) const;
+
+  /// \brief Get hidden state from external per-channel state.
+  Eigen::VectorXf get_hidden_state(const LSTMCellState& state) const
+  {
+    return state._xh(Eigen::placeholders::lastN(this->_get_hidden_size()));
+  }
+
 private:
   // Parameters
   // xh -> ifgo
@@ -47,8 +76,21 @@ private:
   // Cell state
   Eigen::VectorXf _c;
 
+  // Initial state templates (saved from constructor for cloning to new channels)
+  Eigen::VectorXf _initial_xh;
+  Eigen::VectorXf _initial_c;
+
   long _get_hidden_size() const { return this->_b.size() / 4; };
   long _get_input_size() const { return this->_xh.size() - this->_get_hidden_size(); };
+};
+
+/// \brief Mutable per-channel state for a complete LSTM model.
+/// One of these per audio channel; the LSTM class holds the shared weights.
+struct LSTMChannelState : public ChannelState
+{
+  std::vector<LSTMCellState> layers;
+  Eigen::VectorXf _input;
+  Eigen::VectorXf _output;
 };
 
 /// \brief A multi-layer LSTM model
@@ -78,6 +120,23 @@ public:
   /// \param num_frames Number of frames to process
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
 
+  // --- Shared-weight multi-channel API ----------------------------------------
+
+  /// \brief Create a fresh channel state (per-cell states + I/O vectors).
+  LSTMChannelState createTypedChannelState() const;
+
+  /// \brief Process using shared weights and external channel state.
+  void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+               LSTMChannelState& state) const;
+
+  /// \brief Prewarm an external channel state by processing silence.
+  void prewarmTypedChannelState(LSTMChannelState& state) const;
+
+  // --- DSP virtual interface overrides ----------------------------------------
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
+
 protected:
   // Hacky, but a half-second seems to work for most models.
   int PrewarmSamples() override;
@@ -87,6 +146,7 @@ protected:
   std::vector<LSTMCell> _layers;
 
   void _process_sample();
+  void _process_sample(LSTMChannelState& state) const;
 
   // Input to the LSTM.
   // Since this is assumed to not be a parametric model, its shape should be (in_channels,)

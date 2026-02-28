@@ -141,6 +141,17 @@ void Conv1D::SetMaxBufferSize(const int maxBufferSize)
   _output.setZero();
 }
 
+RingBuffer Conv1D::createFreshRingBuffer() const
+{
+  RingBuffer rb;
+  const long kernel_size = get_kernel_size();
+  const long dilation = get_dilation();
+  const long receptive_field = kernel_size > 0 ? (kernel_size - 1) * dilation : 0;
+  rb.SetMaxLookback(receptive_field);
+  rb.Reset(get_in_channels(), _max_buffer_size);
+  return rb;
+}
+
 
 void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
 {
