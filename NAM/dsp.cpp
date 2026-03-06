@@ -122,6 +122,11 @@ void nam::DSP::prepareBatch(int /*maxBatchSize*/)
   // Default: no-op. LSTM overrides to allocate batch matrices.
 }
 
+void nam::DSP::setPreferSmallBatchProcessing(bool /*enabled*/)
+{
+  // Default: no-op. LSTM overrides to opt small batches into the GEMM path.
+}
+
 double nam::DSP::GetLoudness() const
 {
   if (!HasLoudness())

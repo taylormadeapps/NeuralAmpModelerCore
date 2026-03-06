@@ -429,11 +429,17 @@ void nam::lstm::LSTM::prepareBatch(int maxBatchSize)
   _batch_output.resize(this->_head_weight.rows(), maxBatchSize);
 }
 
+void nam::lstm::LSTM::setPreferSmallBatchProcessing(bool enabled)
+{
+  _prefer_small_batch_processing.store(enabled, std::memory_order_relaxed);
+}
+
 void nam::lstm::LSTM::processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
                                             int numFrames, ChannelState** states, int numChannels)
 {
   // Fallback to sequential for small batch sizes or if batch scratch not allocated.
-  if (numChannels <= 2 || _max_batch_size < numChannels)
+  const bool preferSmallBatch = _prefer_small_batch_processing.load(std::memory_order_relaxed);
+  if (((!preferSmallBatch) && numChannels <= 2) || _max_batch_size < numChannels)
   {
     DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
     return;

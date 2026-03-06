@@ -4,6 +4,7 @@
 #include <map>
 #include <vector>
 #include <memory>
+#include <atomic>
 
 #include <Eigen/Dense>
 
@@ -147,6 +148,7 @@ public:
   void processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
                             int numFrames, ChannelState** states, int numChannels) override;
   void prepareBatch(int maxBatchSize) override;
+  void setPreferSmallBatchProcessing(bool enabled) override;
 
 protected:
   // Hacky, but a half-second seems to work for most models.
@@ -176,6 +178,7 @@ protected:
   Eigen::MatrixXf _batch_hidden;  // (dh × max_batch) — last layer hidden states
   Eigen::MatrixXf _batch_output;  // (out_ch × max_batch) — head projection result
   int _max_batch_size = 0;
+  std::atomic<bool> _prefer_small_batch_processing { false };
 };
 
 /// \brief Configuration for an LSTM model
