@@ -121,10 +121,6 @@ public:
   /// Default: no-op. LSTM overrides to allocate batch matrices.
   virtual void prepareBatch(int maxBatchSize);
 
-  /// \brief Prefer the architecture's batch path even for small channel counts.
-  /// Called from TayPE's NAM AMX toggle; default implementations ignore it.
-  virtual void setPreferSmallBatchProcessing(bool enabled);
-
   /// \brief Get the expected sample rate
   /// \return Expected sample rate in Hz (-1.0 if unknown)
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };
