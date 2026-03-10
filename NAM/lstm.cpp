@@ -46,7 +46,18 @@ void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x)
   // Assign inputs
   this->_xh(Eigen::seq(0, input_size - 1)) = x;
   // The matmul
+#if defined(__APPLE__)
+  this->_ifgo = this->_b;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_w.rows(), (int)this->_w.cols(),
+              1.0f,
+              this->_w.data(), (int)this->_w.rows(),
+              this->_xh.data(), 1,
+              1.0f,
+              this->_ifgo.data(), 1);
+#else
   this->_ifgo = this->_w * this->_xh + this->_b;
+#endif
   // Elementwise updates (apply nonlinearities here)
   const long i_offset = 0;
   const long f_offset = hidden_size;
@@ -94,7 +105,18 @@ void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x, LSTMCellState& stat
   // Assign inputs
   state._xh(Eigen::seq(0, input_size - 1)) = x;
   // The matmul — shared weights, external state
+#if defined(__APPLE__)
+  state._ifgo = this->_b;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_w.rows(), (int)this->_w.cols(),
+              1.0f,
+              this->_w.data(), (int)this->_w.rows(),
+              state._xh.data(), 1,
+              1.0f,
+              state._ifgo.data(), 1);
+#else
   state._ifgo = this->_w * state._xh + this->_b;
+#endif
   // Elementwise updates (apply nonlinearities)
   const long i_offset = 0;
   const long f_offset = hidden_size;
@@ -285,10 +307,19 @@ void nam::lstm::LSTM::_process_sample()
 
   // Compute matrix-vector product: (out_channels x hidden_size) * (hidden_size) = (out_channels)
   // Store directly in _output (which is already sized correctly in constructor)
+#if defined(__APPLE__)
+  this->_output = this->_head_bias;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_head_weight.rows(), (int)this->_head_weight.cols(),
+              1.0f,
+              this->_head_weight.data(), (int)this->_head_weight.rows(),
+              hidden_state.data(), 1,
+              1.0f,
+              this->_output.data(), 1);
+#else
   this->_output.noalias() = this->_head_weight * hidden_state;
-
-  // Add bias: (out_channels) += (out_channels)
   this->_output.noalias() += this->_head_bias;
+#endif
 }
 
 // --- LSTM shared-weight multi-channel API ------------------------------------
@@ -349,8 +380,19 @@ void nam::lstm::LSTM::_process_sample(LSTMChannelState& state) const
     this->_layers[this->_layers.size() - 1].get_hidden_state(
       state.layers[this->_layers.size() - 1]);
 
+#if defined(__APPLE__)
+  state._output = this->_head_bias;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_head_weight.rows(), (int)this->_head_weight.cols(),
+              1.0f,
+              this->_head_weight.data(), (int)this->_head_weight.rows(),
+              hidden_state.data(), 1,
+              1.0f,
+              state._output.data(), 1);
+#else
   state._output.noalias() = this->_head_weight * hidden_state;
   state._output.noalias() += this->_head_bias;
+#endif
 }
 
 void nam::lstm::LSTM::prewarmTypedChannelState(LSTMChannelState& state) const
@@ -437,9 +479,14 @@ void nam::lstm::LSTM::setPreferSmallBatchProcessing(bool enabled)
 void nam::lstm::LSTM::processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
                                             int numFrames, ChannelState** states, int numChannels)
 {
-  // Fallback to sequential for small batch sizes or if batch scratch not allocated.
-  const bool preferSmallBatch = _prefer_small_batch_processing.load(std::memory_order_relaxed);
-  if (((!preferSmallBatch) && numChannels <= 2) || _max_batch_size < numChannels)
+  // Fallback to sequential for singleton/stereo work or if batch scratch was not allocated.
+  //
+  // TayPE's fork previously let the "prefer small batch" hint force N<=2
+  // through the batched GEMM path. Microbenchmarks on Apple Silicon with the
+  // Prosonic LSTM model showed that path is ~3.6x slower than plain sequential
+  // processChannel() at 64/128/256/512-sample buffers, so mono/stereo work
+  // must stay on the direct path.
+  if (numChannels <= 2 || _max_batch_size < numChannels)
   {
     DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
     return;
