@@ -13,8 +13,6 @@
 
 namespace
 {
-constexpr int kLstmTurboBatchMinChannels = 8;
-
 void applyPackedTanh(float* data, long size)
 {
   if (nam::activations::Activation::using_fast_tanh)
@@ -667,6 +665,9 @@ void nam::lstm::LSTM::processBatchChannels(float* const* monoInputs, float* cons
                                             int numFrames, ChannelState** states, int numChannels)
 {
   const int N = numChannels;
+  setLastBatchKernelDebugInfo(BatchKernelMode::inactive,
+                              BatchKernelFallbackReason::none,
+                              N);
   const int in_channels = NumInputChannels();
   const int out_channels = NumOutputChannels();
   const int numLayers = (int)this->_layers.size();
@@ -688,14 +689,24 @@ void nam::lstm::LSTM::processBatchChannels(float* const* monoInputs, float* cons
   for (int ch = 0; ch < N; ++ch)
     sp[ch] = static_cast<LSTMChannelState*>(states[ch]);
 
-  // Small LSTM groups stay on the shared-weight SGEMV path. The SGEMM path
-  // only becomes reliably worthwhile once the batch is wide enough to amortise
+  // Small LSTM groups stay on the shared-weight SGEMV path. The wide SGEMM
+  // kernel only becomes worthwhile once the batch is wide enough to amortise
   // packing and scatter overhead on this model family.
-  if (N < kLstmTurboBatchMinChannels || _max_batch_size < N)
+  if (N < kTurboBatchMinChannels || _max_batch_size < N)
   {
+    const auto fallbackReason = (_max_batch_size < N)
+        ? BatchKernelFallbackReason::batchScratchTooSmall
+        : BatchKernelFallbackReason::belowTurboThreshold;
+    setLastBatchKernelDebugInfo(BatchKernelMode::packedSmallBatch,
+                                fallbackReason,
+                                N);
     processSmallBatchChannels(monoInputs, monoOutputs, numFrames, sp, N);
     return;
   }
+
+  setLastBatchKernelDebugInfo(BatchKernelMode::turboBatch,
+                              BatchKernelFallbackReason::none,
+                              N);
 
   // Per-layer cell state pointers (reused each sample).
   LSTMCellState* cellStates[64];

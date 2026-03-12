@@ -4,6 +4,7 @@
 #include <map>
 #include <vector>
 #include <memory>
+#include <atomic>
 
 #include <Eigen/Dense>
 
@@ -108,6 +109,32 @@ struct LSTMChannelState : public ChannelState
 class LSTM : public DSP
 {
 public:
+  static constexpr int kTurboBatchMinChannels = 8;
+
+  enum class BatchKernelMode : int
+  {
+    inactive = 0,
+    directSequential = 1,
+    packedSmallBatch = 2,
+    turboBatch = 3,
+  };
+
+  enum class BatchKernelFallbackReason : int
+  {
+    none = 0,
+    belowTurboThreshold = 1,
+    batchScratchTooSmall = 2,
+  };
+
+  struct BatchKernelDebugInfo
+  {
+    BatchKernelMode mode = BatchKernelMode::inactive;
+    BatchKernelFallbackReason fallbackReason = BatchKernelFallbackReason::none;
+    int numChannels = 0;
+    int turboMinChannels = kTurboBatchMinChannels;
+    int maxBatchSize = 0;
+  };
+
   /// \brief Constructor
   /// \param in_channels Number of input channels
   /// \param out_channels Number of output channels
@@ -147,6 +174,16 @@ public:
   void processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
                             int numFrames, ChannelState** states, int numChannels) override;
   void prepareBatch(int maxBatchSize) override;
+  BatchKernelDebugInfo getLastBatchKernelDebugInfo() const
+  {
+    BatchKernelDebugInfo info;
+    info.mode = static_cast<BatchKernelMode>(_lastBatchKernelMode.load(std::memory_order_relaxed));
+    info.fallbackReason = static_cast<BatchKernelFallbackReason>(
+        _lastBatchKernelFallbackReason.load(std::memory_order_relaxed));
+    info.numChannels = _lastBatchKernelChannels.load(std::memory_order_relaxed);
+    info.maxBatchSize = _max_batch_size;
+    return info;
+  }
 
 protected:
   // Hacky, but a half-second seems to work for most models.
@@ -182,9 +219,20 @@ protected:
   Eigen::MatrixXf _batch_hidden;  // (dh × max_batch) — last layer hidden states
   Eigen::MatrixXf _batch_output;  // (out_ch × max_batch) — head projection result
   int _max_batch_size = 0;
+  std::atomic<int> _lastBatchKernelMode { static_cast<int>(BatchKernelMode::inactive) };
+  std::atomic<int> _lastBatchKernelFallbackReason { static_cast<int>(BatchKernelFallbackReason::none) };
+  std::atomic<int> _lastBatchKernelChannels { 0 };
 
   void processSmallBatchChannels(float* const* monoInputs, float* const* monoOutputs,
                                  int numFrames, LSTMChannelState** states, int numChannels);
+  void setLastBatchKernelDebugInfo(BatchKernelMode mode,
+                                   BatchKernelFallbackReason fallbackReason,
+                                   int numChannels)
+  {
+    _lastBatchKernelMode.store(static_cast<int>(mode), std::memory_order_relaxed);
+    _lastBatchKernelFallbackReason.store(static_cast<int>(fallbackReason), std::memory_order_relaxed);
+    _lastBatchKernelChannels.store(numChannels, std::memory_order_relaxed);
+  }
 };
 
 /// \brief Configuration for an LSTM model
