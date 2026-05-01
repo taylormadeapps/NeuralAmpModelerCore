@@ -85,6 +85,21 @@ void nam::wavenet::detail::Head::process(Eigen::MatrixXf& work, const int num_fr
   }
 }
 
+nam::wavenet::detail::HeadChannelState nam::wavenet::detail::Head::createChannelState() const
+{
+  HeadChannelState state;
+  state.conv_ring_buffers.reserve(_convs.size());
+  for (const auto& conv : _convs)
+    state.conv_ring_buffers.push_back(conv.createFreshRingBuffer());
+  return state;
+}
+
+void nam::wavenet::detail::Head::swapChannelState(HeadChannelState& state)
+{
+  for (size_t i = 0; i < _convs.size(); i++)
+    _convs[i].swapRingBuffer(state.conv_ring_buffers[i]);
+}
+
 // Layer ======================================================================
 
 void nam::wavenet::detail::Layer::SetMaxBufferSize(const int maxBufferSize)
@@ -375,6 +390,18 @@ void nam::wavenet::detail::Layer::Process(const Eigen::MatrixXf& input, const Ei
   }
 }
 
+nam::wavenet::detail::LayerChannelState nam::wavenet::detail::Layer::createChannelState() const
+{
+  LayerChannelState state;
+  state.conv_ring_buffer = _conv.createFreshRingBuffer();
+  return state;
+}
+
+void nam::wavenet::detail::Layer::swapChannelState(LayerChannelState& state)
+{
+  _conv.swapRingBuffer(state.conv_ring_buffer);
+}
+
 // LayerArray =================================================================
 
 nam::wavenet::detail::LayerArray::LayerArray(const LayerArrayParams& params)
@@ -421,6 +448,23 @@ long nam::wavenet::detail::LayerArray::get_receptive_field() const
     result += this->_layers[i].get_dilation() * (this->_layers[i].get_kernel_size() - 1);
   result += (long)this->_head_rechannel.get_kernel_size() - 1;
   return result;
+}
+
+nam::wavenet::detail::LayerArrayChannelState nam::wavenet::detail::LayerArray::createChannelState() const
+{
+  LayerArrayChannelState state;
+  state.layers.reserve(_layers.size());
+  for (const auto& layer : _layers)
+    state.layers.push_back(layer.createChannelState());
+  state.head_rechannel_ring_buffer = _head_rechannel.createFreshRingBuffer();
+  return state;
+}
+
+void nam::wavenet::detail::LayerArray::swapChannelState(LayerArrayChannelState& state)
+{
+  for (size_t i = 0; i < _layers.size(); i++)
+    _layers[i].swapChannelState(state.layers[i]);
+  _head_rechannel.swapRingBuffer(state.head_rechannel_ring_buffer);
 }
 
 
@@ -689,7 +733,40 @@ void nam::wavenet::WaveNet::SetMaxBufferSize(const int maxBufferSize)
   }
 }
 
+std::unique_ptr<nam::ChannelState> nam::wavenet::WaveNet::createChannelState() const
+{
+  auto state = std::make_unique<WaveNetChannelState>();
+
+  if (this->_condition_dsp != nullptr)
+  {
+    state->condition_state = this->_condition_dsp->createChannelState();
+  }
+
+  state->layer_arrays.reserve(this->_layer_arrays.size());
+  for (const auto& layer_array : this->_layer_arrays)
+    state->layer_arrays.push_back(layer_array.createChannelState());
+
+  if (this->_post_stack_head != nullptr)
+    state->post_stack_head = std::make_unique<detail::HeadChannelState>(this->_post_stack_head->createChannelState());
+
+  return state;
+}
+
+void nam::wavenet::WaveNet::swapChannelState(WaveNetChannelState& state)
+{
+  for (size_t i = 0; i < this->_layer_arrays.size(); i++)
+    this->_layer_arrays[i].swapChannelState(state.layer_arrays[i]);
+
+  if (this->_post_stack_head != nullptr && state.post_stack_head != nullptr)
+    this->_post_stack_head->swapChannelState(*state.post_stack_head);
+}
+
 void nam::wavenet::WaveNet::_process_condition(const int num_frames)
+{
+  _process_condition(num_frames, nullptr);
+}
+
+void nam::wavenet::WaveNet::_process_condition(const int num_frames, ChannelState* condition_state)
 {
   if (this->_condition_dsp == nullptr)
   {
@@ -708,8 +785,16 @@ void nam::wavenet::WaveNet::_process_condition(const int num_frames)
     }
 
     // Process through condition DSP using pre-allocated buffers
-    this->_condition_dsp->process(
-      this->_condition_dsp_input_ptrs.data(), this->_condition_dsp_output_ptrs.data(), num_frames);
+    if (condition_state != nullptr)
+    {
+      this->_condition_dsp->processChannel(
+        this->_condition_dsp_input_ptrs.data(), this->_condition_dsp_output_ptrs.data(), num_frames, *condition_state);
+    }
+    else
+    {
+      this->_condition_dsp->process(
+        this->_condition_dsp_input_ptrs.data(), this->_condition_dsp_output_ptrs.data(), num_frames);
+    }
 
     // Copy output data back to Eigen matrix
     const int condition_output_channels = this->_condition_dsp->NumOutputChannels();
@@ -736,11 +821,23 @@ void nam::wavenet::WaveNet::_set_condition_array(NAM_SAMPLE** input, const int n
 
 void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames)
 {
+  processInternal(input, output, num_frames, nullptr);
+}
+
+void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                    WaveNetChannelState& state)
+{
+  processInternal(input, output, num_frames, state.condition_state.get());
+}
+
+void nam::wavenet::WaveNet::processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                            ChannelState* condition_state)
+{
   assert(num_frames <= mMaxBufferSize);
   const int out_channels = NumOutputChannels();
 
   this->_set_condition_array(input, num_frames);
-  this->_process_condition(num_frames);
+  this->_process_condition(num_frames, condition_state);
 
   // Main layer arrays:
   // Layer-to-layer
@@ -822,6 +919,53 @@ void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
       }
     }
   }
+}
+
+void nam::wavenet::WaveNet::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                           ChannelState& state)
+{
+  auto& waveNetState = static_cast<WaveNetChannelState&>(state);
+  swapChannelState(waveNetState);
+  process(input, output, num_frames, waveNetState);
+  swapChannelState(waveNetState);
+}
+
+void nam::wavenet::WaveNet::prewarmChannelState(ChannelState& state)
+{
+  if (mMaxBufferSize == 0)
+    SetMaxBufferSize(NAM_DEFAULT_MAX_BUFFER_SIZE);
+
+  const int prewarmSamples = PrewarmSamples();
+  if (prewarmSamples == 0)
+    return;
+
+  auto& waveNetState = static_cast<WaveNetChannelState&>(state);
+  const int bufferSize = std::max(mMaxBufferSize, 1);
+  std::vector<std::vector<NAM_SAMPLE>> inputBuffers(NumInputChannels());
+  std::vector<std::vector<NAM_SAMPLE>> outputBuffers(NumOutputChannels());
+  std::vector<NAM_SAMPLE*> inputPtrs(NumInputChannels());
+  std::vector<NAM_SAMPLE*> outputPtrs(NumOutputChannels());
+
+  for (int ch = 0; ch < NumInputChannels(); ch++)
+  {
+    inputBuffers[ch].resize(bufferSize, (NAM_SAMPLE)0.0);
+    inputPtrs[ch] = inputBuffers[ch].data();
+  }
+  for (int ch = 0; ch < NumOutputChannels(); ch++)
+  {
+    outputBuffers[ch].resize(bufferSize, (NAM_SAMPLE)0.0);
+    outputPtrs[ch] = outputBuffers[ch].data();
+  }
+
+  swapChannelState(waveNetState);
+  int samplesProcessed = 0;
+  while (samplesProcessed < prewarmSamples)
+  {
+    const int blockSize = std::min(bufferSize, prewarmSamples - samplesProcessed);
+    process(inputPtrs.data(), outputPtrs.data(), blockSize, waveNetState);
+    samplesProcessed += blockSize;
+  }
+  swapChannelState(waveNetState);
 }
 
 // Config parser - extracts all configuration from JSON without constructing the DSP

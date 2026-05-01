@@ -81,6 +81,42 @@ void nam::DSP::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_fr
   }
 }
 
+std::unique_ptr<nam::ChannelState> nam::DSP::createChannelState() const
+{
+  return nullptr;
+}
+
+void nam::DSP::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& /*state*/)
+{
+  process(input, output, num_frames);
+}
+
+void nam::DSP::prewarmChannelState(ChannelState& /*state*/)
+{
+  prewarm();
+}
+
+void nam::DSP::processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                                    int numFrames, ChannelState** states, int numChannels)
+{
+  float* inputPtrs[1];
+  float* outputPtrs[1];
+
+  for (int ch = 0; ch < numChannels; ++ch)
+  {
+    if (states[ch] == nullptr)
+      continue;
+
+    inputPtrs[0] = monoInputs[ch];
+    outputPtrs[0] = monoOutputs[ch];
+    processChannel(inputPtrs, outputPtrs, numFrames, *states[ch]);
+  }
+}
+
+void nam::DSP::prepareBatch(int /*maxBatchSize*/)
+{
+}
+
 double nam::DSP::GetLoudness() const
 {
   if (!HasLoudness())

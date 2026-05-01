@@ -19,6 +19,13 @@ namespace nam
 namespace wavenet
 {
 
+struct WaveNetChannelState : public ChannelState
+{
+  std::unique_ptr<ChannelState> condition_state;
+  std::vector<detail::LayerArrayChannelState> layer_arrays;
+  std::unique_ptr<detail::HeadChannelState> post_stack_head;
+};
+
 /// \brief The main WaveNet model
 ///
 /// WaveNet is a dilated convolutional neural network architecture for audio processing.
@@ -58,6 +65,12 @@ public:
   /// \param num_frames Number of frames to process
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
 
+  void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, WaveNetChannelState& state);
+
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
+
   /// \brief Set model weights from a vector
   /// \param weights Vector containing all model weights
   void set_weights_(std::vector<float>& weights);
@@ -87,6 +100,7 @@ protected:
   /// passes it through directly.
   /// \param num_frames Number of frames to process
   virtual void _process_condition(const int num_frames);
+  void _process_condition(const int num_frames, ChannelState* condition_state);
 
   /// \brief Fill in the "condition" array that's fed into the various parts of the net
   ///
@@ -112,6 +126,9 @@ private:
 
   int mPrewarmSamples = 0; // Pre-compute during initialization
   int PrewarmSamples() override { return mPrewarmSamples; };
+
+  void processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState* condition_state);
+  void swapChannelState(WaveNetChannelState& state);
 };
 
 /// \brief Configuration for a WaveNet model

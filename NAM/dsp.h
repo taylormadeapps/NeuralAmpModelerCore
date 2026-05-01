@@ -33,6 +33,17 @@
 
 namespace nam
 {
+
+/// \brief Base class for per-channel mutable state.
+///
+/// Architecture subclasses define concrete state for recurrent buffers, ring
+/// buffers, and other mutable processing history. The DSP object keeps shared
+/// model weights; callers keep one ChannelState per audio lane.
+struct ChannelState
+{
+  virtual ~ChannelState() = default;
+};
+
 namespace wavenet
 {
 /// Forward declaration to allow WaveNet to access protected members of DSP
@@ -79,6 +90,33 @@ public:
   /// \param output Output audio buffers. Same structure as input.
   /// \param num_frames Number of frames to process
   virtual void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames);
+
+  /// \brief Create a fresh per-channel state for this model.
+  /// \return Unique pointer to a ChannelState, or nullptr if unsupported.
+  virtual std::unique_ptr<ChannelState> createChannelState() const;
+
+  /// \brief Process one channel using shared weights and external state.
+  /// \param input Input audio buffers
+  /// \param output Output audio buffers
+  /// \param num_frames Number of frames to process
+  /// \param state Per-channel state from createChannelState()
+  virtual void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state);
+
+  /// \brief Prewarm an external channel state by processing silence.
+  /// \param state Per-channel state from createChannelState()
+  virtual void prewarmChannelState(ChannelState& state);
+
+  /// \brief Process N mono channels through shared weights.
+  ///
+  /// Default implementation is a sequential processChannel() loop. Architecture
+  /// subclasses can override with pre-allocated batch kernels.
+  virtual void processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                                    int numFrames, ChannelState** states, int numChannels);
+
+  /// \brief Pre-allocate architecture-owned batch scratch buffers.
+  /// Called off the audio thread when the lane count changes.
+  virtual void prepareBatch(int maxBatchSize);
+
   /// \brief Get the expected sample rate
   /// \return Expected sample rate in Hz (-1.0 if unknown)
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };

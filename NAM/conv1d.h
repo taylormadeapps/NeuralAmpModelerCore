@@ -117,6 +117,12 @@ public:
   /// \return true if bias is present, false otherwise
   bool has_bias() const { return this->_bias.size() > 0; };
 
+  /// \brief Create a fresh ring buffer configured like this layer's internal buffer.
+  RingBuffer createFreshRingBuffer() const;
+
+  /// \brief Swap the internal ring buffer with an external one.
+  void swapRingBuffer(RingBuffer& other) { std::swap(_input_buffer, other); }
+
 protected:
   // conv[kernel](cout, cin) - used for non-depthwise convolutions
   std::vector<Eigen::MatrixXf> _weight;

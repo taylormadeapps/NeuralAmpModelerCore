@@ -20,6 +20,22 @@ namespace wavenet
 namespace detail
 {
 
+struct LayerChannelState
+{
+  RingBuffer conv_ring_buffer;
+};
+
+struct LayerArrayChannelState
+{
+  std::vector<LayerChannelState> layers;
+  RingBuffer head_rechannel_ring_buffer;
+};
+
+struct HeadChannelState
+{
+  std::vector<RingBuffer> conv_ring_buffers;
+};
+
 /// \brief A single WaveNet layer block
 ///
 /// A WaveNet layer performs the following operations:
@@ -224,6 +240,9 @@ public:
   /// \return Const reference to the internal Conv1D object
   const Conv1D& get_conv() const { return _conv; }
 
+  LayerChannelState createChannelState() const;
+  void swapChannelState(LayerChannelState& state);
+
 private:
   // The dilated convolution at the front of the block
   Conv1D _conv;
@@ -335,6 +354,9 @@ public:
   /// \return Receptive field size
   long get_receptive_field() const;
 
+  LayerArrayChannelState createChannelState() const;
+  void swapChannelState(LayerArrayChannelState& state);
+
 private:
   // The rechannel before the layers
   Conv1x1 _rechannel;
@@ -375,6 +397,9 @@ public:
   void process(Eigen::MatrixXf& work, int num_frames);
 
   const Eigen::MatrixXf& get_last_output() const { return _convs.back().GetOutput(); }
+
+  HeadChannelState createChannelState() const;
+  void swapChannelState(HeadChannelState& state);
 
 private:
   std::vector<nam::Conv1D> _convs;

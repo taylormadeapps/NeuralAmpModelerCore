@@ -322,6 +322,70 @@ void nam::convnet::ConvNet::_rewind_buffers_()
   this->Buffer::_rewind_buffers_();
 }
 
+// --- Shared-weight multi-channel API -----------------------------------------
+
+nam::convnet::ConvNetChannelState nam::convnet::ConvNet::createTypedChannelState() const
+{
+  ConvNetChannelState state;
+
+  // Create fresh Conv1D ring buffers — one per ConvNetBlock
+  state.conv_ring_buffers.reserve(_blocks.size());
+  for (const auto& block : _blocks)
+    state.conv_ring_buffers.push_back(block.conv.createFreshRingBuffer());
+
+  // Clone Buffer base class input history
+  const int in_channels = NumInputChannels();
+  state.input_buffers.resize(in_channels);
+  for (int ch = 0; ch < in_channels; ch++)
+  {
+    state.input_buffers[ch].resize(_input_buffers[ch].size());
+    std::fill(state.input_buffers[ch].begin(), state.input_buffers[ch].end(), 0.0f);
+  }
+  state.input_buffer_offset = _receptive_field;
+
+  return state;
+}
+
+void nam::convnet::ConvNet::swapChannelState(ConvNetChannelState& state)
+{
+  // Swap Conv1D ring buffers
+  for (size_t i = 0; i < _blocks.size(); i++)
+    _blocks[i].conv.swapRingBuffer(state.conv_ring_buffers[i]);
+
+  // Swap Buffer base class state
+  std::swap(_input_buffers, state.input_buffers);
+  std::swap(_input_buffer_offset, state.input_buffer_offset);
+}
+
+void nam::convnet::ConvNet::prewarmTypedChannelState(ConvNetChannelState& state)
+{
+  swapChannelState(state);  // Load the channel state into the engine
+  prewarm();                // Process silence through PrewarmSamples()
+  swapChannelState(state);  // Save the warmed state back
+}
+
+// --- DSP virtual interface overrides -----------------------------------------
+
+std::unique_ptr<nam::ChannelState> nam::convnet::ConvNet::createChannelState() const
+{
+  return std::make_unique<ConvNetChannelState>(createTypedChannelState());
+}
+
+void nam::convnet::ConvNet::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                           ChannelState& state)
+{
+  auto& convNetState = static_cast<ConvNetChannelState&>(state);
+  swapChannelState(convNetState);
+  process(input, output, num_frames);
+  swapChannelState(convNetState);
+}
+
+void nam::convnet::ConvNet::prewarmChannelState(ChannelState& state)
+{
+  auto& convNetState = static_cast<ConvNetChannelState&>(state);
+  prewarmTypedChannelState(convNetState);
+}
+
 // Config parser
 nam::convnet::ConvNetConfig nam::convnet::parse_config_json(const nlohmann::json& config)
 {
@@ -341,8 +405,8 @@ nam::convnet::ConvNetConfig nam::convnet::parse_config_json(const nlohmann::json
 // ConvNetConfig::create()
 std::unique_ptr<nam::DSP> nam::convnet::ConvNetConfig::create(std::vector<float> weights, double sampleRate)
 {
-  return std::make_unique<nam::convnet::ConvNet>(
-    in_channels, out_channels, channels, dilations, batchnorm, activation, weights, sampleRate, groups);
+  return std::make_unique<nam::convnet::ConvNet>(in_channels, out_channels, channels, dilations, batchnorm, activation,
+                                                 weights, sampleRate, groups);
 }
 
 // Config parser for ConfigParserRegistry
