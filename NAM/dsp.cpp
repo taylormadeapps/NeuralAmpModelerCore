@@ -10,6 +10,9 @@
 
 #include "dsp.h"
 #include "registry.h"
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
 
 #define tanh_impl_ std::tanh
 // #define tanh_impl_ fast_tanh_
@@ -846,4 +849,35 @@ void nam::Conv1x1::process_(const Eigen::Ref<const Eigen::MatrixXf>& input, cons
     _output.leftCols(num_frames).colwise() += this->_bias;
 #endif
   }
+}
+
+void nam::Conv1x1::processBatch(const Eigen::MatrixXf& input, const int num_frames, const int num_channels,
+                                Eigen::MatrixXf& output) const
+{
+  assert(supportsDenseBatch() && "processBatch requires a dense non-depthwise Conv1x1");
+  assert(num_frames > 0 && num_channels > 0);
+
+  const int packed_cols = num_frames * num_channels;
+  const long in_channels = get_in_channels();
+  const long out_channels = get_out_channels();
+
+  assert(input.rows() == in_channels);
+  assert(input.cols() >= packed_cols);
+  assert(output.rows() == out_channels);
+  assert(output.cols() >= packed_cols);
+
+#if defined(__APPLE__)
+  cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+              (int)out_channels, packed_cols, (int)in_channels,
+              1.0f,
+              this->_weight.data(), (int)out_channels,
+              input.data(), (int)in_channels,
+              0.0f,
+              output.data(), (int)out_channels);
+#else
+  output.leftCols(packed_cols).noalias() = this->_weight * input.leftCols(packed_cols);
+#endif
+
+  if (this->_do_bias)
+    output.leftCols(packed_cols).colwise() += this->_bias;
 }

@@ -194,7 +194,22 @@ public:
   ///
   /// Outputs are stored internally and accessible via GetOutputNextLayer() and GetOutputHead().
   /// Only the first num_frames columns of the output buffers are valid.
-  void Process(const Eigen::MatrixXf& input, const Eigen::MatrixXf& condition, const int num_frames);
+  void Process(const Eigen::MatrixXf& input, const Eigen::MatrixXf& condition, const int num_frames,
+               LayerChannelState* state = nullptr);
+
+  void PrepareBatch(const int maxBufferSize, const int maxBatchSize);
+  bool supportsDenseBatch() const;
+  void ProcessBatch(const Eigen::MatrixXf& packed_input, const Eigen::MatrixXf& packed_condition,
+                    RingBuffer* const* conv_ring_buffers, const int num_frames, const int num_channels);
+
+  struct BatchProfileDebugInfo
+  {
+    long long convNs = 0;
+    long long inputMixinNs = 0;
+    long long sumActivationNs = 0;
+    long long layer1x1Ns = 0;
+    long long residualNs = 0;
+  };
 
   /// \brief Get the number of channels expected as input/output from this layer
   /// \return Number of channels
@@ -232,6 +247,9 @@ public:
   /// \return Const reference to the head output buffer
   const Eigen::MatrixXf& GetOutputHead() const { return _skip_head_copy ? this->_z : this->_output_head; }
 
+  Eigen::MatrixXf& GetBatchOutputNextLayer() { return this->_batch_output_next_layer; }
+  Eigen::MatrixXf& GetBatchOutputHead() { return _skip_head_copy ? this->_batch_z : this->_batch_output_head; }
+
   /// \brief Access Conv1D for Reset() propagation (needed for LayerArray)
   /// \return Reference to the internal Conv1D object
   Conv1D& get_conv() { return _conv; }
@@ -242,6 +260,7 @@ public:
 
   LayerChannelState createChannelState() const;
   void swapChannelState(LayerChannelState& state);
+  BatchProfileDebugInfo getLastBatchProfileDebugInfo() const { return _lastBatchProfileDebugInfo; }
 
 private:
   // The dilated convolution at the front of the block
@@ -258,6 +277,15 @@ private:
   Eigen::MatrixXf _output_next_layer;
   // Output to head (skip connection: activated conv output)
   Eigen::MatrixXf _output_head;
+
+  Eigen::MatrixXf _batch_conv_output;
+  Eigen::MatrixXf _batch_input_mixin_output;
+  Eigen::MatrixXf _batch_layer1x1_output;
+  Eigen::MatrixXf _batch_z;
+  Eigen::MatrixXf _batch_output_next_layer;
+  Eigen::MatrixXf _batch_output_head;
+  Eigen::MatrixXf _batch_conv_input_scratch;
+  BatchProfileDebugInfo _lastBatchProfileDebugInfo;
 
   activations::Activation::Ptr _activation;
   const GatingMode _gating_mode;
@@ -308,7 +336,8 @@ public:
   /// \param layer_inputs Input to the layer array (input_size x num_frames)
   /// \param condition Conditioning input (condition_size x num_frames)
   /// \param num_frames Number of frames to process
-  void Process(const Eigen::MatrixXf& layer_inputs, const Eigen::MatrixXf& condition, const int num_frames);
+  void Process(const Eigen::MatrixXf& layer_inputs, const Eigen::MatrixXf& condition, const int num_frames,
+               LayerArrayChannelState* state = nullptr);
 
   /// \brief Process with a given previous head input (subsequent layer arrays)
   ///
@@ -319,7 +348,8 @@ public:
   /// \param head_inputs Head input from previous layer array (head_input_size x num_frames)
   /// \param num_frames Number of frames to process
   void Process(const Eigen::MatrixXf& layer_inputs, const Eigen::MatrixXf& condition,
-               const Eigen::MatrixXf& head_inputs, const int num_frames);
+               const Eigen::MatrixXf& head_inputs, const int num_frames,
+               LayerArrayChannelState* state = nullptr);
 
   /// \brief Get output from last layer (for next layer array)
   ///
@@ -357,6 +387,37 @@ public:
   LayerArrayChannelState createChannelState() const;
   void swapChannelState(LayerArrayChannelState& state);
 
+  struct BatchProfileDebugInfo
+  {
+    int layerCount = 0;
+    long long totalNs = 0;
+    long long headInputSetupNs = 0;
+    long long rechannelNs = 0;
+    long long layerStatePtrNs = 0;
+    long long layerProcessNs = 0;
+    long long headAccumNs = 0;
+    long long layerOutputCopyNs = 0;
+    long long headStatePtrNs = 0;
+    long long headRechannelNs = 0;
+    long long layerConvNs = 0;
+    long long layerInputMixinNs = 0;
+    long long layerSumActivationNs = 0;
+    long long layer1x1Ns = 0;
+    long long layerResidualNs = 0;
+  };
+
+  void PrepareBatch(const int maxBufferSize, const int maxBatchSize);
+  bool supportsDenseBatch() const;
+  void ProcessBatch(const Eigen::MatrixXf& packed_layer_inputs, const Eigen::MatrixXf& packed_condition,
+                    LayerArrayChannelState** states, const int num_frames, const int num_channels);
+  void ProcessBatch(const Eigen::MatrixXf& packed_layer_inputs, const Eigen::MatrixXf& packed_condition,
+                    const Eigen::MatrixXf& packed_head_inputs, LayerArrayChannelState** states,
+                    const int num_frames, const int num_channels);
+
+  Eigen::MatrixXf& GetBatchLayerOutputs() { return this->_batch_layer_outputs; }
+  Eigen::MatrixXf& GetBatchHeadOutputs() { return this->_batch_head_outputs; }
+  BatchProfileDebugInfo getLastBatchProfileDebugInfo() const { return this->_lastBatchProfileDebugInfo; }
+
 private:
   // The rechannel before the layers
   Conv1x1 _rechannel;
@@ -375,9 +436,19 @@ private:
   // Head output size from each layer (head1x1.out_channels if active, else bottleneck)
   const int _head_output_size;
 
+  Eigen::MatrixXf _batch_layer_outputs;
+  Eigen::MatrixXf _batch_head_inputs;
+  Eigen::MatrixXf _batch_head_outputs;
+  Eigen::MatrixXf _batch_head_rechannel_input_scratch;
+  std::vector<RingBuffer*> _batch_ring_buffer_ptrs;
+  BatchProfileDebugInfo _lastBatchProfileDebugInfo;
+
   long _get_channels() const;
   // Common processing logic after head inputs are set
-  void ProcessInner(const Eigen::MatrixXf& layer_inputs, const Eigen::MatrixXf& condition, const int num_frames);
+  void ProcessInner(const Eigen::MatrixXf& layer_inputs, const Eigen::MatrixXf& condition, const int num_frames,
+                    LayerArrayChannelState* state);
+  void ProcessBatchInner(const Eigen::MatrixXf& packed_layer_inputs, const Eigen::MatrixXf& packed_condition,
+                         LayerArrayChannelState** states, const int num_frames, const int num_channels);
 };
 
 /// \brief Post-stack head: repeated (activation → Conv1D) with dilation 1, stride 1, valid (causal streaming) conv.
@@ -394,7 +465,7 @@ public:
 
   /// \param work Input buffer (in_channels × maxBufferSize); first in_channels×num_frames scaled by head_scale;
   ///             may be modified in place.
-  void process(Eigen::MatrixXf& work, int num_frames);
+  void process(Eigen::MatrixXf& work, int num_frames, HeadChannelState* state = nullptr);
 
   const Eigen::MatrixXf& get_last_output() const { return _convs.back().GetOutput(); }
 

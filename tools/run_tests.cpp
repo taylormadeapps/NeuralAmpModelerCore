@@ -171,6 +171,7 @@ int main()
   test_wavenet::test_full::test_wavenet_zero_input();
   test_wavenet::test_full::test_wavenet_different_buffer_sizes();
   test_wavenet::test_full::test_wavenet_prewarm();
+  test_wavenet::test_full::test_wavenet_process_channel_matches_standalone_process();
   test_wavenet::test_head1x1::test_head1x1_inactive();
   test_wavenet::test_head1x1::test_head1x1_active();
   test_wavenet::test_head1x1::test_head1x1_gated();
@@ -321,8 +322,12 @@ int main()
   test_a2_fast::test_detector_rejects_gating();
   test_a2_fast::test_matches_generic_nano();
   test_a2_fast::test_matches_generic_standard();
+  test_a2_fast::test_channel_state_matches_standalone_nano();
+  test_a2_fast::test_channel_state_matches_standalone_standard();
   test_a2_fast::test_process_realtime_safe_nano();
   test_a2_fast::test_process_realtime_safe_standard();
+  test_a2_fast::test_process_channel_realtime_safe_nano();
+  test_a2_fast::test_process_channel_realtime_safe_standard();
 #endif
 
   std::cout << "Success!" << std::endl;

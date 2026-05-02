@@ -26,7 +26,7 @@ static nam::wavenet::LayerArrayParams make_layer_array_params(
   const nam::activations::ActivationConfig& activation_config, const nam::wavenet::GatingMode gating_mode,
   const bool head_bias, const int groups_input, const int groups_input_mixin,
   const nam::wavenet::Layer1x1Params& layer1x1_params, const nam::wavenet::Head1x1Params& head1x1_params,
-  const nam::activations::ActivationConfig& secondary_activation_config)
+  const nam::activations::ActivationConfig& secondary_activation_config, const int head_kernel_size = 1)
 {
   auto film_params = make_default_film_params();
   // Duplicate activation_config, gating_mode, and secondary_activation_config for each layer (based on dilations size)
@@ -35,11 +35,96 @@ static nam::wavenet::LayerArrayParams make_layer_array_params(
   std::vector<nam::activations::ActivationConfig> secondary_activation_configs(
     dilations.size(), secondary_activation_config);
   return nam::wavenet::LayerArrayParams(
-    input_size, condition_size, head_size, 1, channels, bottleneck, std::move(kernel_sizes), std::move(dilations),
+    input_size, condition_size, head_size, head_kernel_size, channels, bottleneck, std::move(kernel_sizes),
+    std::move(dilations),
     std::move(activation_configs), std::move(gating_modes), head_bias, groups_input, groups_input_mixin,
     layer1x1_params, head1x1_params, std::move(secondary_activation_configs), film_params, film_params, film_params,
     film_params, film_params, film_params, film_params, film_params);
 }
+
+static std::unique_ptr<nam::wavenet::WaveNet> create_channel_state_parity_wavenet()
+{
+  const int input_size = 1;
+  const int condition_size = 1;
+  const int head_size = 1;
+  const int channels = 1;
+  const int bottleneck = channels;
+  const float head_scale = 0.8f;
+  const bool with_head = true;
+  const auto activation = nam::activations::ActivationConfig::simple(nam::activations::ActivationType::ReLU);
+  const nam::wavenet::GatingMode gating_mode = nam::wavenet::GatingMode::NONE;
+  const bool head_bias = false;
+  const int groups = 1;
+  const int groups_input_mixin = 1;
+  nam::wavenet::Layer1x1Params layer1x1_params(true, 1);
+  nam::wavenet::Head1x1Params head1x1_params(false, channels, 1);
+
+  std::vector<nam::wavenet::LayerArrayParams> layer_array_params;
+  layer_array_params.push_back(make_layer_array_params(
+    input_size, condition_size, head_size, channels, bottleneck, {3}, {2}, activation, gating_mode, head_bias,
+    groups, groups_input_mixin, layer1x1_params, head1x1_params, nam::activations::ActivationConfig{}, 3));
+
+  nam::wavenet::HeadParams head_params;
+  head_params.in_channels = head_size;
+  head_params.channels = 1;
+  head_params.out_channels = 1;
+  head_params.kernel_sizes = {3};
+  head_params.activation_config = activation;
+
+  std::vector<float> weights;
+  weights.push_back(1.0f); // Layer-array rechannel
+  weights.insert(weights.end(), {0.20f, -0.10f, 0.30f, 0.01f}); // Dilated layer Conv1D + bias
+  weights.push_back(0.40f); // Input mixin
+  weights.insert(weights.end(), {0.75f, -0.02f}); // Layer 1x1 + bias
+  weights.insert(weights.end(), {0.30f, -0.20f, 0.10f}); // Layer-array head rechannel
+  weights.insert(weights.end(), {0.25f, -0.15f, 0.35f, 0.005f}); // Post-stack head Conv1D + bias
+  weights.push_back(head_scale);
+
+  std::unique_ptr<nam::wavenet::WaveNet> condition_dsp = nullptr;
+  return std::make_unique<nam::wavenet::WaveNet>(
+    input_size, layer_array_params, head_scale, with_head, head_params, weights, std::move(condition_dsp), 48000.0);
+}
+
+void test_wavenet_process_channel_matches_standalone_process()
+{
+  auto standalone = create_channel_state_parity_wavenet();
+  auto shared = create_channel_state_parity_wavenet();
+  const int maxBufferSize = 16;
+
+  standalone->Reset(48000.0, maxBufferSize);
+  shared->Reset(48000.0, maxBufferSize);
+
+  auto shared_state = shared->createChannelState();
+  assert(shared_state != nullptr);
+
+  standalone->prewarm();
+  shared->prewarmChannelState(*shared_state);
+
+  int sampleIndex = 0;
+  for (const int numFrames : {5, 3, 7})
+  {
+    std::vector<NAM_SAMPLE> input(numFrames);
+    for (int i = 0; i < numFrames; i++)
+      input[i] = (NAM_SAMPLE)(0.05f * (float)((sampleIndex++ % 9) - 4));
+
+    std::vector<NAM_SAMPLE> standalone_output(numFrames, 0.0f);
+    std::vector<NAM_SAMPLE> shared_output(numFrames, 0.0f);
+    NAM_SAMPLE* inputPtrs[] = {input.data()};
+    NAM_SAMPLE* standaloneOutputPtrs[] = {standalone_output.data()};
+    NAM_SAMPLE* sharedOutputPtrs[] = {shared_output.data()};
+
+    standalone->process(inputPtrs, standaloneOutputPtrs, numFrames);
+    shared->processChannel(inputPtrs, sharedOutputPtrs, numFrames, *shared_state);
+
+    for (int i = 0; i < numFrames; i++)
+    {
+      assert(std::isfinite(standalone_output[i]));
+      assert(std::isfinite(shared_output[i]));
+      assert(std::abs(standalone_output[i] - shared_output[i]) < 1.0e-6f);
+    }
+  }
+}
+
 // Test full WaveNet model
 void test_wavenet_model()
 {

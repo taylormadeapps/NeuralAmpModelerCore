@@ -66,12 +66,41 @@ public:
   ~A2FastModel() override = default;
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames) override;
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
+  DSP::RuntimeImplementation GetRuntimeImplementation() const override { return DSP::RuntimeImplementation::a2Fast; }
 
 protected:
   void SetMaxBufferSize(int maxBufferSize) override;
   int PrewarmSamples() override { return _prewarm_samples; }
 
 private:
+  struct RingState
+  {
+    std::vector<float> history;
+#if NAM_A2_RING_MODE == 1
+    // pow2 ring + tail mirror. Storage = (pow2_size + max_buffer_size) cols.
+    // write_pos is kept in [0, pow2_size), reads use (pos & pow2_mask) and are
+    // always contiguous because cols [pow2_size, pow2_size + max_buffer_size)
+    // mirror cols [0, max_buffer_size).
+    int pow2_size = 0;
+    int pow2_mask = 0;
+    int write_pos = 0;
+#else
+    // Linear ring with sporadic memmove-rewind. history_cols = 2*max_lookback +
+    // max_buffer_size; write_pos grows monotonically until rewind fires.
+    int history_cols = 0;
+    int write_pos = 0;
+#endif
+  };
+
+  struct A2FastChannelState : public ChannelState
+  {
+    std::array<RingState, kNumLayers> layers;
+    RingState head;
+  };
+
   struct Layer
   {
     int kernel_size = 0;
@@ -90,22 +119,8 @@ private:
     std::array<float, Channels * Channels> l1x1_w{};
     std::array<float, Channels> l1x1_b{};
 
-    // Conv1D input history ring buffer, column-major (Channels rows).
-    std::vector<float> history;
-#if NAM_A2_RING_MODE == 1
-    // pow2 ring + tail mirror. Storage = (pow2_size + max_buffer_size) cols.
-    // write_pos is kept in [0, pow2_size), reads use (pos & pow2_mask) and are
-    // always contiguous because cols [pow2_size, pow2_size + max_buffer_size)
-    // mirror cols [0, max_buffer_size).
-    int pow2_size = 0;
-    int pow2_mask = 0;
-    int write_pos = 0;
-#else
-    // Linear ring with sporadic memmove-rewind. history_cols = 2*max_lookback +
-    // max_buffer_size; write_pos grows monotonically until rewind fires.
-    int history_cols = 0;
-    int write_pos = 0;
-#endif
+    // Standalone process() state. Shared-weight lanes use A2FastChannelState.
+    RingState ring;
   };
 
   std::array<Layer, kNumLayers> _layers;
@@ -122,16 +137,8 @@ private:
   // WaveNet reads it the same way, overriding the JSON head_scale field).
   float _head_scale = kHeadScale;
 
-  // Head ring buffer (Channels rows, col-major). Same ring layout as per-layer.
-  std::vector<float> _head_history;
-#if NAM_A2_RING_MODE == 1
-  int _head_pow2_size = 0;
-  int _head_pow2_mask = 0;
-  int _head_write_pos = 0;
-#else
-  int _head_history_cols = 0;
-  int _head_write_pos = 0;
-#endif
+  // Standalone process() head state. Shared-weight lanes use A2FastChannelState.
+  RingState _head_ring;
 
   // Working buffers (all Channels rows, max_buffer_size cols, col-major).
   std::vector<float> _layer_in; // current layer input / next layer input (in-place residual)
@@ -143,16 +150,20 @@ private:
   int _prewarm_samples = 0;
 
   void _load_weights(std::vector<float>& weights);
-  void _ring_write(Layer& L, int num_frames);
-  void _head_ring_write(int num_frames);
-  void _layer_forward(int layer_idx, const float* cond, int num_frames);
-  void _head_forward(float* output, int num_frames);
+  RingState _make_ring_state(int max_lookback, int maxBufferSize) const;
+  void _prepare_ring_state(RingState& state, int max_lookback, int maxBufferSize) const;
+  void _ring_write(RingState& state, int max_lookback, const float* src, int num_frames);
+  void _ring_write(Layer& L, RingState& state, int num_frames);
+  void _head_ring_write(RingState& state, int num_frames);
+  void _layer_forward(int layer_idx, A2FastChannelState* state, const float* cond, int num_frames);
+  void _head_forward(float* output, int num_frames, A2FastChannelState* state);
+  void processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames, A2FastChannelState* state);
 
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
   // template parameter so clang can fully unroll the tap loop and schedule
   // FMAs across taps. For the A2 shape we only need K=6 and K=15.
   template <int KernelSize>
-  void _layer_forward_k(Layer& L, const float* cond, int num_frames);
+  void _layer_forward_k(Layer& L, RingState& state, const float* cond, int num_frames);
 };
 
 // -----------------------------------------------------------------------------
@@ -299,29 +310,34 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   _head_out.assign(static_cast<size_t>(maxBufferSize), 0.0f);
 
   for (auto& L : _layers)
-  {
-#if NAM_A2_RING_MODE == 1
-    L.pow2_size = next_pow2(L.max_lookback + maxBufferSize);
-    L.pow2_mask = L.pow2_size - 1;
-    L.history.assign(static_cast<size_t>(Channels) * (L.pow2_size + maxBufferSize), 0.0f);
-    L.write_pos = L.max_lookback;
-#else
-    L.history_cols = 2 * L.max_lookback + maxBufferSize;
-    L.history.assign(static_cast<size_t>(Channels) * L.history_cols, 0.0f);
-    L.write_pos = L.max_lookback;
-#endif
-  }
+    _prepare_ring_state(L.ring, L.max_lookback, maxBufferSize);
 
   const int head_lookback = kHeadKernelSize - 1;
+  _prepare_ring_state(_head_ring, head_lookback, maxBufferSize);
+}
+
+template <int Channels>
+typename A2FastModel<Channels>::RingState
+A2FastModel<Channels>::_make_ring_state(int max_lookback, int maxBufferSize) const
+{
+  RingState state;
+  _prepare_ring_state(state, max_lookback, maxBufferSize);
+  return state;
+}
+
+template <int Channels>
+void A2FastModel<Channels>::_prepare_ring_state(RingState& state, int max_lookback, int maxBufferSize) const
+{
+  const int buffer_size = std::max(maxBufferSize, 1);
 #if NAM_A2_RING_MODE == 1
-  _head_pow2_size = next_pow2(head_lookback + maxBufferSize);
-  _head_pow2_mask = _head_pow2_size - 1;
-  _head_history.assign(static_cast<size_t>(Channels) * (_head_pow2_size + maxBufferSize), 0.0f);
-  _head_write_pos = head_lookback;
+  state.pow2_size = next_pow2(max_lookback + buffer_size);
+  state.pow2_mask = state.pow2_size - 1;
+  state.history.assign(static_cast<size_t>(Channels) * (state.pow2_size + buffer_size), 0.0f);
+  state.write_pos = max_lookback;
 #else
-  _head_history_cols = 2 * head_lookback + maxBufferSize;
-  _head_history.assign(static_cast<size_t>(Channels) * _head_history_cols, 0.0f);
-  _head_write_pos = head_lookback;
+  state.history_cols = 2 * max_lookback + buffer_size;
+  state.history.assign(static_cast<size_t>(Channels) * state.history_cols, 0.0f);
+  state.write_pos = max_lookback;
 #endif
 }
 
@@ -334,14 +350,14 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 //   and reset write_pos. That memmove is the jitter spike we're measuring.
 // -----------------------------------------------------------------------------
 template <int Channels>
-void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
+void A2FastModel<Channels>::_ring_write(RingState& state, int max_lookback, const float* src, int num_frames)
 {
 #if NAM_A2_RING_MODE == 1
+  (void)max_lookback;
   const int mbs = GetMaxBufferSize();
-  float* const hist = L.history.data();
-  const float* const src = _layer_in.data();
-  const int wp = L.write_pos;
-  const int first = std::min(num_frames, L.pow2_size - wp);
+  float* const hist = state.history.data();
+  const int wp = state.write_pos;
+  const int first = std::min(num_frames, state.pow2_size - wp);
   std::memcpy(hist + static_cast<size_t>(wp) * Channels, src,
               static_cast<size_t>(first) * Channels * sizeof(float));
   if (first < num_frames)
@@ -349,54 +365,34 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
     std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
                 static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
   }
-  std::memcpy(hist + static_cast<size_t>(L.pow2_size) * Channels, hist,
+  std::memcpy(hist + static_cast<size_t>(state.pow2_size) * Channels, hist,
               static_cast<size_t>(mbs) * Channels * sizeof(float));
-  L.write_pos = (wp + num_frames) & L.pow2_mask;
+  state.write_pos = (wp + num_frames) & state.pow2_mask;
 #else
-  if (L.write_pos + num_frames > L.history_cols)
+  if (state.write_pos + num_frames > state.history_cols)
   {
-    const int keep = L.max_lookback;
-    std::memmove(L.history.data(), L.history.data() + static_cast<size_t>(L.write_pos - keep) * Channels,
+    const int keep = max_lookback;
+    std::memmove(state.history.data(), state.history.data() + static_cast<size_t>(state.write_pos - keep) * Channels,
                  static_cast<size_t>(keep) * Channels * sizeof(float));
-    L.write_pos = keep;
+    state.write_pos = keep;
   }
-  std::memcpy(L.history.data() + static_cast<size_t>(L.write_pos) * Channels, _layer_in.data(),
+  std::memcpy(state.history.data() + static_cast<size_t>(state.write_pos) * Channels, src,
               static_cast<size_t>(num_frames) * Channels * sizeof(float));
-  L.write_pos += num_frames;
+  state.write_pos += num_frames;
 #endif
 }
 
 template <int Channels>
-void A2FastModel<Channels>::_head_ring_write(int num_frames)
+void A2FastModel<Channels>::_ring_write(Layer& L, RingState& state, int num_frames)
 {
-#if NAM_A2_RING_MODE == 1
-  const int mbs = GetMaxBufferSize();
-  float* const hist = _head_history.data();
-  const float* const src = _head_sum.data();
-  const int wp = _head_write_pos;
-  const int first = std::min(num_frames, _head_pow2_size - wp);
-  std::memcpy(hist + static_cast<size_t>(wp) * Channels, src,
-              static_cast<size_t>(first) * Channels * sizeof(float));
-  if (first < num_frames)
-  {
-    std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
-                static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
-  }
-  std::memcpy(hist + static_cast<size_t>(_head_pow2_size) * Channels, hist,
-              static_cast<size_t>(mbs) * Channels * sizeof(float));
-  _head_write_pos = (wp + num_frames) & _head_pow2_mask;
-#else
-  const int keep = kHeadKernelSize - 1;
-  if (_head_write_pos + num_frames > _head_history_cols)
-  {
-    std::memmove(_head_history.data(), _head_history.data() + static_cast<size_t>(_head_write_pos - keep) * Channels,
-                 static_cast<size_t>(keep) * Channels * sizeof(float));
-    _head_write_pos = keep;
-  }
-  std::memcpy(_head_history.data() + static_cast<size_t>(_head_write_pos) * Channels, _head_sum.data(),
-              static_cast<size_t>(num_frames) * Channels * sizeof(float));
-  _head_write_pos += num_frames;
-#endif
+  _ring_write(state, L.max_lookback, _layer_in.data(), num_frames);
+}
+
+template <int Channels>
+void A2FastModel<Channels>::_head_ring_write(RingState& state, int num_frames)
+{
+  constexpr int head_lookback = kHeadKernelSize - 1;
+  _ring_write(state, head_lookback, _head_sum.data(), num_frames);
 }
 
 // -----------------------------------------------------------------------------
@@ -410,7 +406,7 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
 // runtime dispatcher below for each A2 kernel size (6 and 15).
 template <int Channels>
 template <int KernelSize>
-void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int num_frames)
+void A2FastModel<Channels>::_layer_forward_k(Layer& L, RingState& state, const float* cond, int num_frames)
 {
   constexpr int K = KernelSize;
   const int D = L.dilation;
@@ -419,12 +415,12 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   // reads spanning the wrap land in the tail mirror; in linear mode write_pos
   // is monotonic and arithmetic is plain.
 #if NAM_A2_RING_MODE == 1
-  const int mask = L.pow2_mask;
+  const int mask = state.pow2_mask;
   auto tap_base_phys = [&](int taps_back) {
-    return (L.write_pos - num_frames - taps_back * D) & mask;
+    return (state.write_pos - num_frames - taps_back * D) & mask;
   };
 #else
-  const int base = L.write_pos - num_frames;
+  const int base = state.write_pos - num_frames;
   auto tap_base_phys = [&](int taps_back) { return base - taps_back * D; };
 #endif
 
@@ -463,7 +459,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       const float cb0 = L.conv_b[0], cb1 = L.conv_b[1], cb2 = L.conv_b[2];
       for (int f = 0; f < num_frames; f++)
       {
-        const float* src = &L.history[static_cast<size_t>(tap_base + f) * 3];
+        const float* src = &state.history[static_cast<size_t>(tap_base + f) * 3];
         float a0 = cb0 + w0 * src[0];
         float a1 = cb1 + w1 * src[0];
         float a2 = cb2 + w2 * src[0];
@@ -490,7 +486,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       const float w6 = wk[6], w7 = wk[7], w8 = wk[8];
       for (int f = 0; f < num_frames; f++)
       {
-        const float* src = &L.history[static_cast<size_t>(tap_base + f) * 3];
+        const float* src = &state.history[static_cast<size_t>(tap_base + f) * 3];
         float* zf = z + static_cast<size_t>(f) * 3;
         float a0 = zf[0] + w0 * src[0];
         float a1 = zf[1] + w1 * src[0];
@@ -523,7 +519,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     const float lb0 = L.l1x1_b[0], lb1 = L.l1x1_b[1], lb2 = L.l1x1_b[2];
     for (int f = 0; f < num_frames; f++)
     {
-      const float* src = &L.history[static_cast<size_t>(tap_base_last + f) * 3];
+      const float* src = &state.history[static_cast<size_t>(tap_base_last + f) * 3];
       const float* zf_mem = z + static_cast<size_t>(f) * 3;
       // Final tap GEMV.
       float a0 = zf_mem[0] + cw0 * src[0];
@@ -592,7 +588,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     {
       const int tap_base = tap_base_phys(K - 1 - k);
       Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
-      Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
+      Eigen::Map<const MatCDyn> input_block(&state.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
       ztile.noalias() += W * input_block;
     }
 
@@ -610,17 +606,18 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 // For the A2 shape the detector only admits K in {6, 15}; any other value
 // here means something passed the detector that shouldn't have.
 template <int Channels>
-void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int num_frames)
+void A2FastModel<Channels>::_layer_forward(int layer_idx, A2FastChannelState* state, const float* cond, int num_frames)
 {
   Layer& L = _layers[layer_idx];
-  _ring_write(L, num_frames);
+  RingState& ring = state != nullptr ? state->layers[static_cast<size_t>(layer_idx)] : L.ring;
+  _ring_write(L, ring, num_frames);
   switch (L.kernel_size)
   {
     case 6:
-      _layer_forward_k<6>(L, cond, num_frames);
+      _layer_forward_k<6>(L, ring, cond, num_frames);
       break;
     case 15:
-      _layer_forward_k<15>(L, cond, num_frames);
+      _layer_forward_k<15>(L, ring, cond, num_frames);
       break;
     default:
       throw std::runtime_error("A2FastModel: unexpected kernel_size "
@@ -632,16 +629,17 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
 // Head: K=16 dilation-1 conv from Channels to 1, plus bias + scale.
 // -----------------------------------------------------------------------------
 template <int Channels>
-void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
+void A2FastModel<Channels>::_head_forward(float* output, int num_frames, A2FastChannelState* state)
 {
-  _head_ring_write(num_frames);
+  RingState& ring = state != nullptr ? state->head : _head_ring;
+  _head_ring_write(ring, num_frames);
 #if NAM_A2_RING_MODE == 1
-  const int mask = _head_pow2_mask;
+  const int mask = ring.pow2_mask;
   auto col_of = [&](int f, int k) {
-    return (_head_write_pos - num_frames + f - (kHeadKernelSize - 1 - k)) & mask;
+    return (ring.write_pos - num_frames + f - (kHeadKernelSize - 1 - k)) & mask;
   };
 #else
-  const int base = _head_write_pos - num_frames;
+  const int base = ring.write_pos - num_frames;
   auto col_of = [&](int f, int k) { return base + f - (kHeadKernelSize - 1 - k); };
 #endif
 
@@ -651,7 +649,7 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
     for (int k = 0; k < kHeadKernelSize; k++)
     {
       const int col = col_of(f, k);
-      const float* src = &_head_history[static_cast<size_t>(col) * Channels];
+      const float* src = &ring.history[static_cast<size_t>(col) * Channels];
       const float* wk = _head_w[k].data();
       for (int b = 0; b < Channels; b++)
         y += wk[b] * src[b];
@@ -668,6 +666,70 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
 {
   if (num_frames > GetMaxBufferSize())
     SetMaxBufferSize(num_frames);
+
+  processInternal(input, output, num_frames, nullptr);
+}
+
+template <int Channels>
+std::unique_ptr<ChannelState> A2FastModel<Channels>::createChannelState() const
+{
+  auto state = std::make_unique<A2FastChannelState>();
+  const int max_buffer_size = GetMaxBufferSize() > 0 ? GetMaxBufferSize() : NAM_DEFAULT_MAX_BUFFER_SIZE;
+  for (int i = 0; i < kNumLayers; i++)
+    state->layers[static_cast<size_t>(i)] = _make_ring_state(_layers[static_cast<size_t>(i)].max_lookback,
+                                                             max_buffer_size);
+  state->head = _make_ring_state(kHeadKernelSize - 1, max_buffer_size);
+  return state;
+}
+
+template <int Channels>
+void A2FastModel<Channels>::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames, ChannelState& state)
+{
+  auto& a2_state = static_cast<A2FastChannelState&>(state);
+  processInternal(input, output, num_frames, &a2_state);
+}
+
+template <int Channels>
+void A2FastModel<Channels>::prewarmChannelState(ChannelState& state)
+{
+  auto& a2_state = static_cast<A2FastChannelState&>(state);
+
+  if (GetMaxBufferSize() == 0)
+    SetMaxBufferSize(NAM_DEFAULT_MAX_BUFFER_SIZE);
+
+  const int max_buffer_size = GetMaxBufferSize();
+  for (int i = 0; i < kNumLayers; i++)
+    _prepare_ring_state(a2_state.layers[static_cast<size_t>(i)], _layers[static_cast<size_t>(i)].max_lookback,
+                        max_buffer_size);
+  _prepare_ring_state(a2_state.head, kHeadKernelSize - 1, max_buffer_size);
+
+  const int prewarm_samples = PrewarmSamples();
+  if (prewarm_samples == 0)
+    return;
+
+  const int buffer_size = std::max(max_buffer_size, 1);
+  std::vector<NAM_SAMPLE> input_buffer(static_cast<size_t>(buffer_size), static_cast<NAM_SAMPLE>(0));
+  std::vector<NAM_SAMPLE> output_buffer(static_cast<size_t>(buffer_size), static_cast<NAM_SAMPLE>(0));
+  NAM_SAMPLE* input_ptrs[] = {input_buffer.data()};
+  NAM_SAMPLE* output_ptrs[] = {output_buffer.data()};
+
+  int samples_processed = 0;
+  while (samples_processed < prewarm_samples)
+  {
+    processInternal(input_ptrs, output_ptrs, buffer_size, &a2_state);
+    samples_processed += buffer_size;
+  }
+}
+
+template <int Channels>
+void A2FastModel<Channels>::processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames,
+                                            A2FastChannelState* state)
+{
+  if (num_frames > GetMaxBufferSize())
+  {
+    std::fill_n(output[0], num_frames, static_cast<NAM_SAMPLE>(0));
+    return;
+  }
 
   const NAM_SAMPLE* in0 = input[0];
   NAM_SAMPLE* out0 = output[0];
@@ -688,11 +750,11 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   std::memset(_head_sum.data(), 0, static_cast<size_t>(num_frames) * Channels * sizeof(float));
 
   for (int li = 0; li < kNumLayers; li++)
-    _layer_forward(li, cond, num_frames);
+    _layer_forward(li, state, cond, num_frames);
 
   // Output.
   float* head_out = _head_out.data();
-  _head_forward(head_out, num_frames);
+  _head_forward(head_out, num_frames, state);
   for (int f = 0; f < num_frames; f++)
     out0[f] = static_cast<NAM_SAMPLE>(head_out[f]);
 }

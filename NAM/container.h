@@ -19,6 +19,11 @@ struct Submodel
   std::unique_ptr<DSP> model;
 };
 
+struct ContainerChannelState : public ChannelState
+{
+  std::vector<std::unique_ptr<ChannelState>> submodel_states;
+};
+
 /// \brief A container model that holds multiple submodels at different sizes
 ///
 /// SetSlimmableSize selects the active submodel based on the max_value thresholds.
@@ -33,6 +38,13 @@ public:
   ContainerModel(std::vector<Submodel> submodels, const double expected_sample_rate);
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
+  RuntimeImplementation GetRuntimeImplementation() const override;
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
+  void processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                            int numFrames, ChannelState** states, int numChannels) override;
+  void prepareBatch(int maxBatchSize) override;
   void prewarm() override;
   void Reset(const double sampleRate, const int maxBufferSize) override;
   void SetSlimmableSize(const double val) override;
@@ -45,6 +57,7 @@ private:
   size_t _active_index = 0;
 
   DSP& _active_model() { return *_submodels[_active_index].model; }
+  const DSP& _active_model() const { return *_submodels[_active_index].model; }
 };
 
 // Config / registration

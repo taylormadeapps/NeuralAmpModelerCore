@@ -54,6 +54,69 @@ void ContainerModel::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int 
   _active_model().process(input, output, num_frames);
 }
 
+DSP::RuntimeImplementation ContainerModel::GetRuntimeImplementation() const
+{
+  return _active_model().GetRuntimeImplementation();
+}
+
+std::unique_ptr<ChannelState> ContainerModel::createChannelState() const
+{
+  auto state = std::make_unique<ContainerChannelState>();
+  state->submodel_states.reserve(_submodels.size());
+
+  for (const auto& sm : _submodels)
+  {
+    auto submodel_state = sm.model->createChannelState();
+    if (submodel_state == nullptr)
+      return nullptr;
+
+    state->submodel_states.push_back(std::move(submodel_state));
+  }
+
+  return state;
+}
+
+void ContainerModel::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state)
+{
+  auto* container_state = dynamic_cast<ContainerChannelState*>(&state);
+  if (container_state == nullptr
+      || _active_index >= _submodels.size()
+      || _active_index >= container_state->submodel_states.size()
+      || container_state->submodel_states[_active_index] == nullptr)
+  {
+    DSP::process(input, output, num_frames);
+    return;
+  }
+
+  _active_model().processChannel(input, output, num_frames, *container_state->submodel_states[_active_index]);
+}
+
+void ContainerModel::prewarmChannelState(ChannelState& state)
+{
+  auto* container_state = dynamic_cast<ContainerChannelState*>(&state);
+  if (container_state == nullptr || container_state->submodel_states.size() != _submodels.size())
+    return;
+
+  for (size_t i = 0; i < _submodels.size(); ++i)
+  {
+    auto& submodel_state = container_state->submodel_states[i];
+    if (submodel_state != nullptr)
+      _submodels[i].model->prewarmChannelState(*submodel_state);
+  }
+}
+
+void ContainerModel::processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                                          int numFrames, ChannelState** states, int numChannels)
+{
+  DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+}
+
+void ContainerModel::prepareBatch(int maxBatchSize)
+{
+  for (auto& sm : _submodels)
+    sm.model->prepareBatch(maxBatchSize);
+}
+
 void ContainerModel::prewarm()
 {
   for (auto& sm : _submodels)

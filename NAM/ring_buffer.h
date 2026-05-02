@@ -30,6 +30,12 @@ public:
   /// \param num_frames Number of frames to write
   void Write(const Eigen::MatrixXf& input, const int num_frames);
 
+  /// \brief Write a contiguous column range from a larger packed input matrix
+  /// \param input Input matrix containing the source range
+  /// \param column_start First source column to write
+  /// \param num_frames Number of frames to write
+  void WriteColumns(const Eigen::MatrixXf& input, const int column_start, const int num_frames);
+
   /// \brief Read data with optional lookback
   /// \param num_frames Number of frames to read
   /// \param lookback Number of frames to look back from write pointer (default 0)

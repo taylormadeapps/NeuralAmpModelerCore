@@ -3,6 +3,7 @@
 // This header defines the WaveNet end-user model: ``WaveNet`` (DSP), ``WaveNetConfig``, and JSON helpers
 // ``parse_config_json`` / ``create_config``. Lower-level building blocks live in ``params.h`` and ``detail.h``.
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -40,6 +41,8 @@ struct WaveNetChannelState : public ChannelState
 class WaveNet : public DSP
 {
 public:
+  static constexpr int kDenseBatchMinChannels = 8;
+
   /// \brief Constructor
   /// \param in_channels Number of input channels
   /// \param layer_array_params Parameters for each layer array
@@ -70,6 +73,75 @@ public:
   std::unique_ptr<ChannelState> createChannelState() const override;
   void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
   void prewarmChannelState(ChannelState& state) override;
+  void processBatchChannels(float* const* monoInputs, float* const* monoOutputs,
+                            int numFrames, ChannelState** states, int numChannels) override;
+  void prepareBatch(int maxBatchSize) override;
+
+  enum class BatchKernelMode : int
+  {
+    inactive = 0,
+    directSequential = 1,
+    denseBatch = 2,
+  };
+
+  enum class BatchKernelFallbackReason : int
+  {
+    none = 0,
+    belowDenseThreshold = 1,
+    unsupportedShape = 2,
+    batchScratchTooSmall = 3,
+    invalidState = 4,
+    denseBatchDisabled = 5,
+  };
+
+  struct BatchKernelDebugInfo
+  {
+    BatchKernelMode mode = BatchKernelMode::inactive;
+    BatchKernelFallbackReason fallbackReason = BatchKernelFallbackReason::none;
+    int numChannels = 0;
+    int denseMinChannels = kDenseBatchMinChannels;
+    int maxBatchSize = 0;
+  };
+
+  struct BatchProfileDebugInfo
+  {
+    int numFrames = 0;
+    int numChannels = 0;
+    int layerArrayCount = 0;
+    long long totalNs = 0;
+    long long inputPackNs = 0;
+    long long conditionCopyNs = 0;
+    long long layerStatePtrNs = 0;
+    long long layerProcessNs = 0;
+    long long outputScatterNs = 0;
+    int layerCount = 0;
+    long long layerArrayHeadInputSetupNs = 0;
+    long long layerArrayRechannelNs = 0;
+    long long layerArrayLayerStatePtrNs = 0;
+    long long layerArrayLayerProcessNs = 0;
+    long long layerArrayHeadAccumNs = 0;
+    long long layerArrayOutputCopyNs = 0;
+    long long layerArrayHeadStatePtrNs = 0;
+    long long layerArrayHeadRechannelNs = 0;
+    long long layerConvNs = 0;
+    long long layerInputMixinNs = 0;
+    long long layerSumActivationNs = 0;
+    long long layer1x1Ns = 0;
+    long long layerResidualNs = 0;
+  };
+
+  BatchKernelDebugInfo getLastBatchKernelDebugInfo() const
+  {
+    BatchKernelDebugInfo info;
+    info.mode = static_cast<BatchKernelMode>(_lastBatchKernelMode.load(std::memory_order_relaxed));
+    info.fallbackReason =
+      static_cast<BatchKernelFallbackReason>(_lastBatchKernelFallbackReason.load(std::memory_order_relaxed));
+    info.numChannels = _lastBatchKernelChannels.load(std::memory_order_relaxed);
+    info.maxBatchSize = _max_batch_size;
+    return info;
+  }
+
+  BatchProfileDebugInfo getLastBatchProfileDebugInfo() const { return _lastBatchProfileDebugInfo; }
 
   /// \brief Set model weights from a vector
   /// \param weights Vector containing all model weights
@@ -124,11 +196,29 @@ private:
   /// Scratch (in_channels × maxBufferSize) for scaled head input when ``_post_stack_head`` is used
   Eigen::MatrixXf _scaled_head_scratch;
 
+  int _max_batch_size = 0;
+  Eigen::MatrixXf _batch_condition_input;
+  Eigen::MatrixXf _batch_condition_output;
+  std::vector<WaveNetChannelState*> _batch_state_ptrs;
+  std::vector<detail::LayerArrayChannelState*> _batch_layer_array_state_ptrs;
+  BatchProfileDebugInfo _lastBatchProfileDebugInfo;
+  std::atomic<int> _lastBatchKernelMode { static_cast<int>(BatchKernelMode::inactive) };
+  std::atomic<int> _lastBatchKernelFallbackReason { static_cast<int>(BatchKernelFallbackReason::none) };
+  std::atomic<int> _lastBatchKernelChannels { 0 };
+
   int mPrewarmSamples = 0; // Pre-compute during initialization
   int PrewarmSamples() override { return mPrewarmSamples; };
 
-  void processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState* condition_state);
+  void processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, WaveNetChannelState* state);
   void swapChannelState(WaveNetChannelState& state);
+  bool supportsDenseBatch() const;
+  void resizeBatchScratch();
+  void setLastBatchKernelDebugInfo(BatchKernelMode mode, BatchKernelFallbackReason fallbackReason, int numChannels)
+  {
+    _lastBatchKernelMode.store(static_cast<int>(mode), std::memory_order_relaxed);
+    _lastBatchKernelFallbackReason.store(static_cast<int>(fallbackReason), std::memory_order_relaxed);
+    _lastBatchKernelChannels.store(numChannels, std::memory_order_relaxed);
+  }
 };
 
 /// \brief Configuration for a WaveNet model
