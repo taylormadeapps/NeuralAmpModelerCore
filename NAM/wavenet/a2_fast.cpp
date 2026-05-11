@@ -837,11 +837,13 @@ bool is_a2_shape(const nlohmann::json& config, int* channels)
   if (head_it != config.end() && !head_it->is_null())
     return false;
 
-  // head_scale must be exactly 0.01
+  // head_scale is not part of the A2 identity. Exporters may write the
+  // effective value here, while A2Fast loads the runtime scale from weights.
   auto hs_it = config.find("head_scale");
   if (hs_it == config.end() || !hs_it->is_number())
     return false;
-  if (!close_to(hs_it->get<float>(), kHeadScale))
+  const float head_scale = hs_it->get<float>();
+  if (!std::isfinite(head_scale) || head_scale <= 0.0f)
     return false;
 
   // in_channels defaults to 1, must be 1
