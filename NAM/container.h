@@ -46,6 +46,7 @@ public:
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
   RuntimeImplementation GetRuntimeImplementation() const override;
+  SharedBatchKernelDebugInfo GetSharedBatchKernelDebugInfo() const override;
   std::unique_ptr<ChannelState> createChannelState() const override;
   void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
   void prewarmChannelState(ChannelState& state) override;
@@ -64,7 +65,11 @@ private:
 
   std::vector<Submodel> _submodels;
   std::atomic<size_t> _active_index{0};
+  std::atomic<size_t> _last_batch_index{0};
   std::mutex _slim_set_mutex;
+  std::vector<ChannelState*> _batch_submodel_states;
+  std::vector<int> _submodel_batch_forwarding_min_channels;
+  int _minimum_batch_forwarding_channels = 0;
 
   DSP& _model_at(const size_t index) { return *_submodels[index].model; }
   const DSP& _model_at(const size_t index) const { return *_submodels[index].model; }

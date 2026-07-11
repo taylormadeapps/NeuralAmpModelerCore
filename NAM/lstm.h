@@ -178,6 +178,29 @@ public:
     return info;
   }
 
+  SharedBatchKernelDebugInfo GetSharedBatchKernelDebugInfo() const override
+  {
+    const auto debug = getLastBatchKernelDebugInfo();
+    SharedBatchKernelDebugInfo info;
+    info.available = true;
+    info.mode = debug.mode == BatchKernelMode::packedSmallBatch
+                  ? SharedBatchKernelMode::small
+                  : (debug.mode == BatchKernelMode::turboBatch
+                       ? SharedBatchKernelMode::turbo
+                       : (debug.mode == BatchKernelMode::directSequential
+                            ? SharedBatchKernelMode::direct
+                            : SharedBatchKernelMode::inactive));
+    info.fallbackReason = debug.fallbackReason == BatchKernelFallbackReason::belowTurboThreshold
+                            ? SharedBatchFallbackReason::belowThreshold
+                            : (debug.fallbackReason == BatchKernelFallbackReason::batchScratchTooSmall
+                                 ? SharedBatchFallbackReason::scratchTooSmall
+                                 : SharedBatchFallbackReason::none);
+    info.numChannels = debug.numChannels;
+    info.minBatchChannels = debug.turboMinChannels;
+    info.maxBatchSize = debug.maxBatchSize;
+    return info;
+  }
+
   int GetPrewarmSamples() override;
 
   Eigen::MatrixXf _head_weight; // (out_channels x hidden_size)

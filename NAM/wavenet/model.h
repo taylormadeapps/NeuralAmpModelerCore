@@ -143,6 +143,43 @@ public:
     return info;
   }
 
+  SharedBatchKernelDebugInfo GetSharedBatchKernelDebugInfo() const override
+  {
+    const auto debug = getLastBatchKernelDebugInfo();
+    SharedBatchKernelDebugInfo info;
+    info.available = true;
+    info.mode = debug.mode == BatchKernelMode::denseBatch
+                  ? SharedBatchKernelMode::dense
+                  : (debug.mode == BatchKernelMode::directSequential
+                       ? SharedBatchKernelMode::direct
+                       : SharedBatchKernelMode::inactive);
+    switch (debug.fallbackReason)
+    {
+      case BatchKernelFallbackReason::none:
+        info.fallbackReason = SharedBatchFallbackReason::none;
+        break;
+      case BatchKernelFallbackReason::belowDenseThreshold:
+        info.fallbackReason = SharedBatchFallbackReason::belowThreshold;
+        break;
+      case BatchKernelFallbackReason::batchScratchTooSmall:
+        info.fallbackReason = SharedBatchFallbackReason::scratchTooSmall;
+        break;
+      case BatchKernelFallbackReason::unsupportedShape:
+        info.fallbackReason = SharedBatchFallbackReason::unsupportedShape;
+        break;
+      case BatchKernelFallbackReason::invalidState:
+        info.fallbackReason = SharedBatchFallbackReason::invalidState;
+        break;
+      case BatchKernelFallbackReason::denseBatchDisabled:
+        info.fallbackReason = SharedBatchFallbackReason::disabled;
+        break;
+    }
+    info.numChannels = debug.numChannels;
+    info.minBatchChannels = debug.denseMinChannels;
+    info.maxBatchSize = debug.maxBatchSize;
+    return info;
+  }
+
   BatchProfileDebugInfo getLastBatchProfileDebugInfo() const { return _lastBatchProfileDebugInfo; }
 
   /// \brief Set model weights from a vector

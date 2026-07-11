@@ -87,6 +87,35 @@ public:
     a2Fast = 1
   };
 
+  enum class SharedBatchKernelMode : int
+  {
+    inactive = 0,
+    direct = 1,
+    small = 2,
+    turbo = 3,
+    dense = 4
+  };
+
+  enum class SharedBatchFallbackReason : int
+  {
+    none = 0,
+    belowThreshold = 1,
+    scratchTooSmall = 2,
+    unsupportedShape = 3,
+    invalidState = 4,
+    disabled = 5
+  };
+
+  struct SharedBatchKernelDebugInfo
+  {
+    bool available = false;
+    SharedBatchKernelMode mode = SharedBatchKernelMode::inactive;
+    SharedBatchFallbackReason fallbackReason = SharedBatchFallbackReason::none;
+    int numChannels = 0;
+    int minBatchChannels = 0;
+    int maxBatchSize = 0;
+  };
+
   /// \brief Constructor
   ///
   /// \param in_channels Number of input channels
@@ -118,6 +147,12 @@ public:
   /// This is intentionally separate from the persisted architecture label: a
   /// WaveNet-shaped model may be backed by a specialized runtime such as A2Fast.
   virtual RuntimeImplementation GetRuntimeImplementation() const { return RuntimeImplementation::generic; }
+
+  /// \brief Architecture-neutral diagnostics for the most recent shared batch.
+  ///
+  /// Container models delegate this to the concrete tier that processed the
+  /// batch, allowing hosts to report one direct/small/turbo/dense vocabulary.
+  virtual SharedBatchKernelDebugInfo GetSharedBatchKernelDebugInfo() const { return {}; }
 
   /// \brief Create a fresh per-channel state for this model.
   /// \return Unique pointer to a ChannelState, or nullptr if unsupported.

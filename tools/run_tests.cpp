@@ -322,6 +322,8 @@ int main()
   test_container::test_container_default_is_max_size();
   test_container::test_container_reset_prepares_every_submodel_and_prewarms_only_active();
   test_container::test_container_external_state_is_bound_to_its_submodel();
+  test_container::test_container_keeps_generic_batches_on_direct_bound_state_path();
+  test_container::test_container_forwards_only_a2fast_turbo_batches();
   test_container::test_container_external_state_matches_standalone_at_every_a2_tier();
   test_container::test_container_switch_resets_before_activation();
 
@@ -360,6 +362,10 @@ int main()
   test_a2_fast::test_channel_state_matches_standalone_standard();
   test_a2_fast::test_batch_channel_states_are_isolated_nano();
   test_a2_fast::test_batch_channel_states_are_isolated_standard();
+  test_a2_fast::test_standard_six_lane_batch_stays_direct();
+  test_a2_fast::test_standard_turbo_batch_matches_independent_channels_eight();
+  test_a2_fast::test_standard_batch_kernel_policy();
+  test_a2_fast::test_standard_turbo_batch_realtime_safe();
   test_a2_fast::test_process_realtime_safe_nano();
   test_a2_fast::test_process_realtime_safe_standard();
   test_a2_fast::test_process_channel_realtime_safe_nano();

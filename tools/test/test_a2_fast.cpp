@@ -456,6 +456,219 @@ void test_batch_channel_states_are_isolated_standard()
   test_batch_channel_states_are_isolated(8);
 }
 
+void test_standard_turbo_batch_matches_independent_channels(int num_channels)
+{
+  assert(num_channels >= 8);
+
+  const auto cfg = build_a2_config(8);
+  const int weight_count = a2_weight_count(8);
+  const auto weights = make_deterministic_weights(weight_count, /*seed=*/0xA2BA7C8u + num_channels);
+  constexpr int max_buffer = 256;
+  constexpr int total = 2048;
+
+  std::vector<std::unique_ptr<nam::DSP>> references;
+  references.reserve(static_cast<size_t>(num_channels));
+  for (int lane = 0; lane < num_channels; ++lane)
+  {
+    auto reference_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+    auto lane_weights = weights;
+    auto reference = reference_cfg->create(std::move(lane_weights), 48000.0);
+    reference->Reset(48000.0, max_buffer);
+    references.push_back(std::move(reference));
+  }
+
+  auto shared_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+  auto shared_weights = weights;
+  auto shared = shared_cfg->create(std::move(shared_weights), 48000.0);
+  shared->Reset(48000.0, max_buffer);
+  shared->prepareBatch(num_channels);
+
+  std::vector<std::unique_ptr<nam::ChannelState>> owned_states;
+  std::vector<nam::ChannelState*> states(static_cast<size_t>(num_channels), nullptr);
+  owned_states.reserve(static_cast<size_t>(num_channels));
+  for (int lane = 0; lane < num_channels; ++lane)
+  {
+    auto state = shared->createChannelState();
+    assert(state != nullptr);
+    shared->prewarmChannelState(*state);
+    states[static_cast<size_t>(lane)] = state.get();
+    owned_states.push_back(std::move(state));
+  }
+
+  std::vector<std::vector<NAM_SAMPLE>> inputs(static_cast<size_t>(num_channels));
+  std::vector<std::vector<NAM_SAMPLE>> reference_outputs(static_cast<size_t>(num_channels));
+  std::vector<std::vector<NAM_SAMPLE>> batch_outputs(static_cast<size_t>(num_channels));
+  for (int lane = 0; lane < num_channels; ++lane)
+  {
+    inputs[static_cast<size_t>(lane)] = make_test_input(total, 32000.0 + lane * 1700.0);
+    for (int frame = 0; frame < total; ++frame)
+      inputs[static_cast<size_t>(lane)][static_cast<size_t>(frame)] =
+        static_cast<NAM_SAMPLE>((0.45 + 0.05 * lane)
+                                * inputs[static_cast<size_t>(lane)][static_cast<size_t>(frame)]
+                                + 0.001 * lane);
+    reference_outputs[static_cast<size_t>(lane)].assign(total, static_cast<NAM_SAMPLE>(0));
+    batch_outputs[static_cast<size_t>(lane)].assign(total, static_cast<NAM_SAMPLE>(0));
+  }
+
+  const std::vector<int> block_sizes = {17, 128, 3, 255, 64, 9};
+  int position = 0;
+  int block_index = 0;
+  while (position < total)
+  {
+    const int num_frames = std::min(block_sizes[static_cast<size_t>(block_index % block_sizes.size())],
+                                    total - position);
+    std::vector<NAM_SAMPLE*> batch_inputs(static_cast<size_t>(num_channels), nullptr);
+    std::vector<NAM_SAMPLE*> batch_output_ptrs(static_cast<size_t>(num_channels), nullptr);
+    for (int lane = 0; lane < num_channels; ++lane)
+    {
+      NAM_SAMPLE* input = inputs[static_cast<size_t>(lane)].data() + position;
+      NAM_SAMPLE* reference_output = reference_outputs[static_cast<size_t>(lane)].data() + position;
+      references[static_cast<size_t>(lane)]->process(&input, &reference_output, num_frames);
+      batch_inputs[static_cast<size_t>(lane)] = input;
+      batch_output_ptrs[static_cast<size_t>(lane)] =
+        batch_outputs[static_cast<size_t>(lane)].data() + position;
+    }
+
+    shared->processBatchChannels(batch_inputs.data(), batch_output_ptrs.data(), num_frames,
+                                 states.data(), num_channels);
+    const auto debug = shared->GetSharedBatchKernelDebugInfo();
+    assert(debug.available);
+    assert(debug.mode == nam::DSP::SharedBatchKernelMode::turbo);
+    assert(debug.fallbackReason == nam::DSP::SharedBatchFallbackReason::none);
+    assert(debug.numChannels == num_channels);
+    assert(debug.minBatchChannels == 8);
+
+    position += num_frames;
+    ++block_index;
+  }
+
+  for (int lane = 0; lane < num_channels; ++lane)
+    compare_channel_state(reference_outputs[static_cast<size_t>(lane)],
+                          batch_outputs[static_cast<size_t>(lane)], 8, /*tol=*/2e-5);
+}
+
+void test_standard_six_lane_batch_stays_direct()
+{
+  const auto cfg = build_a2_config(8);
+  auto weights = make_deterministic_weights(a2_weight_count(8), /*seed=*/0xA2BA7CEu);
+  auto fast_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+  auto dsp = fast_cfg->create(std::move(weights), 48000.0);
+  dsp->Reset(48000.0, 128);
+  dsp->prepareBatch(6);
+
+  std::vector<std::unique_ptr<nam::ChannelState>> owned_states;
+  std::vector<nam::ChannelState*> states(6, nullptr);
+  std::vector<std::vector<NAM_SAMPLE>> inputs(6, std::vector<NAM_SAMPLE>(128, static_cast<NAM_SAMPLE>(0.01)));
+  std::vector<std::vector<NAM_SAMPLE>> outputs(6, std::vector<NAM_SAMPLE>(128, static_cast<NAM_SAMPLE>(0)));
+  std::vector<NAM_SAMPLE*> input_ptrs(6, nullptr);
+  std::vector<NAM_SAMPLE*> output_ptrs(6, nullptr);
+  for (int lane = 0; lane < 6; ++lane)
+  {
+    auto state = dsp->createChannelState();
+    assert(state != nullptr);
+    dsp->prewarmChannelState(*state);
+    states[static_cast<size_t>(lane)] = state.get();
+    owned_states.push_back(std::move(state));
+    input_ptrs[static_cast<size_t>(lane)] = inputs[static_cast<size_t>(lane)].data();
+    output_ptrs[static_cast<size_t>(lane)] = outputs[static_cast<size_t>(lane)].data();
+  }
+
+  dsp->processBatchChannels(input_ptrs.data(), output_ptrs.data(), 128, states.data(), 6);
+  const auto debug = dsp->GetSharedBatchKernelDebugInfo();
+  assert(debug.mode == nam::DSP::SharedBatchKernelMode::direct);
+  assert(debug.fallbackReason == nam::DSP::SharedBatchFallbackReason::none);
+  assert(debug.minBatchChannels == 8);
+}
+
+void test_standard_turbo_batch_matches_independent_channels_eight()
+{
+  test_standard_turbo_batch_matches_independent_channels(8);
+}
+
+void test_standard_batch_kernel_policy()
+{
+  const auto cfg = build_a2_config(8);
+  auto weights = make_deterministic_weights(a2_weight_count(8), /*seed=*/0xA2BADC0u);
+  auto fast_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+  auto dsp = fast_cfg->create(std::move(weights), 48000.0);
+  dsp->Reset(48000.0, 128);
+  dsp->prepareBatch(8);
+
+  std::vector<std::unique_ptr<nam::ChannelState>> owned_states;
+  std::vector<nam::ChannelState*> states(8, nullptr);
+  std::vector<std::vector<NAM_SAMPLE>> inputs(8, std::vector<NAM_SAMPLE>(128, static_cast<NAM_SAMPLE>(0.01)));
+  std::vector<std::vector<NAM_SAMPLE>> outputs(8, std::vector<NAM_SAMPLE>(128, static_cast<NAM_SAMPLE>(0)));
+  std::vector<NAM_SAMPLE*> input_ptrs(8, nullptr);
+  std::vector<NAM_SAMPLE*> output_ptrs(8, nullptr);
+  for (int lane = 0; lane < 8; ++lane)
+  {
+    auto state = dsp->createChannelState();
+    assert(state != nullptr);
+    dsp->prewarmChannelState(*state);
+    states[static_cast<size_t>(lane)] = state.get();
+    owned_states.push_back(std::move(state));
+    input_ptrs[static_cast<size_t>(lane)] = inputs[static_cast<size_t>(lane)].data();
+    output_ptrs[static_cast<size_t>(lane)] = outputs[static_cast<size_t>(lane)].data();
+  }
+
+  dsp->processBatchChannels(input_ptrs.data(), output_ptrs.data(), 128, states.data(), 4);
+  auto debug = dsp->GetSharedBatchKernelDebugInfo();
+  assert(debug.mode == nam::DSP::SharedBatchKernelMode::direct);
+  assert(debug.fallbackReason == nam::DSP::SharedBatchFallbackReason::none);
+
+  dsp->processBatchChannels(input_ptrs.data(), output_ptrs.data(), 128, states.data(), 6);
+  debug = dsp->GetSharedBatchKernelDebugInfo();
+  assert(debug.mode == nam::DSP::SharedBatchKernelMode::direct);
+  assert(debug.fallbackReason == nam::DSP::SharedBatchFallbackReason::none);
+
+  dsp->processBatchChannels(input_ptrs.data(), output_ptrs.data(), 128, states.data(), 8);
+  debug = dsp->GetSharedBatchKernelDebugInfo();
+  assert(debug.mode == nam::DSP::SharedBatchKernelMode::turbo);
+  assert(debug.fallbackReason == nam::DSP::SharedBatchFallbackReason::none);
+}
+
+void test_standard_turbo_batch_realtime_safe()
+{
+  const auto cfg = build_a2_config(8);
+  auto weights = make_deterministic_weights(a2_weight_count(8), /*seed=*/0xA2110C8u);
+  auto fast_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+  auto dsp = fast_cfg->create(std::move(weights), 48000.0);
+  constexpr int num_channels = 8;
+  constexpr int num_frames = 128;
+  dsp->Reset(48000.0, num_frames);
+  dsp->prepareBatch(num_channels);
+
+  std::vector<std::unique_ptr<nam::ChannelState>> owned_states;
+  std::vector<nam::ChannelState*> states(num_channels, nullptr);
+  std::vector<std::vector<NAM_SAMPLE>> inputs(
+    num_channels, std::vector<NAM_SAMPLE>(num_frames, static_cast<NAM_SAMPLE>(0.01)));
+  std::vector<std::vector<NAM_SAMPLE>> outputs(
+    num_channels, std::vector<NAM_SAMPLE>(num_frames, static_cast<NAM_SAMPLE>(0)));
+  std::vector<NAM_SAMPLE*> input_ptrs(num_channels, nullptr);
+  std::vector<NAM_SAMPLE*> output_ptrs(num_channels, nullptr);
+  for (int lane = 0; lane < num_channels; ++lane)
+  {
+    auto state = dsp->createChannelState();
+    assert(state != nullptr);
+    dsp->prewarmChannelState(*state);
+    states[static_cast<size_t>(lane)] = state.get();
+    owned_states.push_back(std::move(state));
+    input_ptrs[static_cast<size_t>(lane)] = inputs[static_cast<size_t>(lane)].data();
+    output_ptrs[static_cast<size_t>(lane)] = outputs[static_cast<size_t>(lane)].data();
+  }
+
+  dsp->processBatchChannels(input_ptrs.data(), output_ptrs.data(), num_frames,
+                            states.data(), num_channels);
+  allocation_tracking::run_allocation_test_no_allocations(
+    nullptr,
+    [&]() {
+      for (int iteration = 0; iteration < 8; ++iteration)
+        dsp->processBatchChannels(input_ptrs.data(), output_ptrs.data(), num_frames,
+                                  states.data(), num_channels);
+    },
+    nullptr, "A2FastModel<8>::turboBatch 8x128");
+}
+
 // Real-time safety: once the DSP has been Reset (buffers sized, prewarmed),
 // subsequent process() calls must not allocate or free heap memory. Uses the
 // same allocation-tracking infrastructure as the generic WaveNet RT-safety

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -22,6 +23,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(__APPLE__)
+  #include <Accelerate/Accelerate.h>
+#endif
 
 #include <Eigen/Dense>
 
@@ -61,6 +66,8 @@ public:
   static constexpr int kChannels = Channels;
   static constexpr int kBottleneck = Channels;
   static constexpr int kHeadIn = Channels;
+  static constexpr int kTurboBatchMinChannels = 8;
+  static constexpr bool kTurboBatchEnabled = true;
 
   A2FastModel(std::vector<float> weights, double expected_sample_rate);
   ~A2FastModel() override = default;
@@ -69,7 +76,11 @@ public:
   std::unique_ptr<ChannelState> createChannelState() const override;
   void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames, ChannelState& state) override;
   void prewarmChannelState(ChannelState& state) override;
+  void processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                            int numFrames, ChannelState** states, int numChannels) override;
+  void prepareBatch(int maxBatchSize) override;
   DSP::RuntimeImplementation GetRuntimeImplementation() const override { return DSP::RuntimeImplementation::a2Fast; }
+  SharedBatchKernelDebugInfo GetSharedBatchKernelDebugInfo() const override;
 
 protected:
   void SetMaxBufferSize(int maxBufferSize) override;
@@ -147,17 +158,38 @@ private:
   std::vector<float> _cond;     // float32 copy of the double NAM_SAMPLE input, reused each block
   std::vector<float> _head_out; // float32 head output before writing to NAM_SAMPLE
 
+  // A2 standard turbo scratch. Columns are packed lane-major as
+  // lane * num_frames + frame so every layer can operate across all active
+  // lanes without changing the external per-lane ring-state ownership.
+  std::vector<float> _batch_layer_in;
+  std::vector<float> _batch_head_sum;
+  std::vector<float> _batch_z;
+  std::vector<float> _batch_cond;
+  std::vector<float> _batch_head_out;
+  std::vector<float> _batch_packed_history;
+  std::vector<A2FastChannelState*> _batch_states;
+  int _max_batch_size = 0;
+
+  std::atomic<int> _last_batch_mode{static_cast<int>(SharedBatchKernelMode::inactive)};
+  std::atomic<int> _last_batch_fallback{static_cast<int>(SharedBatchFallbackReason::none)};
+  std::atomic<int> _last_batch_channels{0};
+
   int _prewarm_samples = 0;
 
   void _load_weights(std::vector<float>& weights);
   RingState _make_ring_state(int max_lookback, int maxBufferSize) const;
   void _prepare_ring_state(RingState& state, int max_lookback, int maxBufferSize) const;
   void _ring_write(RingState& state, int max_lookback, const float* src, int num_frames);
-  void _ring_write(Layer& L, RingState& state, int num_frames);
-  void _head_ring_write(RingState& state, int num_frames);
+  void _ring_write(Layer& L, RingState& state, const float* src, int num_frames);
+  void _head_ring_write(RingState& state, const float* src, int num_frames);
   void _layer_forward(int layer_idx, A2FastChannelState* state, const float* cond, int num_frames);
-  void _head_forward(float* output, int num_frames, A2FastChannelState* state);
+  void _head_forward(float* output, const float* head_sum, int num_frames, A2FastChannelState* state);
   void processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames, A2FastChannelState* state);
+  void _resize_batch_scratch(int maxBatchSize);
+  void _process_batch_turbo(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                            int numFrames, int numChannels);
+  template <int KernelSize>
+  void _batch_layer_forward_k(Layer& layer, int layerIndex, int numFrames, int numChannels);
 
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
   // template parameter so clang can fully unroll the tap loop and schedule
@@ -318,6 +350,9 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 
   const int head_lookback = kHeadKernelSize - 1;
   _prepare_ring_state(_head_ring, head_lookback, maxBufferSize);
+
+  if (_max_batch_size > 0)
+    _resize_batch_scratch(_max_batch_size);
 }
 
 template <int Channels>
@@ -387,16 +422,16 @@ void A2FastModel<Channels>::_ring_write(RingState& state, int max_lookback, cons
 }
 
 template <int Channels>
-void A2FastModel<Channels>::_ring_write(Layer& L, RingState& state, int num_frames)
+void A2FastModel<Channels>::_ring_write(Layer& L, RingState& state, const float* src, int num_frames)
 {
-  _ring_write(state, L.max_lookback, _layer_in.data(), num_frames);
+  _ring_write(state, L.max_lookback, src, num_frames);
 }
 
 template <int Channels>
-void A2FastModel<Channels>::_head_ring_write(RingState& state, int num_frames)
+void A2FastModel<Channels>::_head_ring_write(RingState& state, const float* src, int num_frames)
 {
   constexpr int head_lookback = kHeadKernelSize - 1;
-  _ring_write(state, head_lookback, _head_sum.data(), num_frames);
+  _ring_write(state, head_lookback, src, num_frames);
 }
 
 // -----------------------------------------------------------------------------
@@ -614,7 +649,7 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, A2FastChannelState* st
 {
   Layer& L = _layers[layer_idx];
   RingState& ring = state != nullptr ? state->layers[static_cast<size_t>(layer_idx)] : L.ring;
-  _ring_write(L, ring, num_frames);
+  _ring_write(L, ring, _layer_in.data(), num_frames);
   switch (L.kernel_size)
   {
     case 6:
@@ -633,10 +668,11 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, A2FastChannelState* st
 // Head: K=16 dilation-1 conv from Channels to 1, plus bias + scale.
 // -----------------------------------------------------------------------------
 template <int Channels>
-void A2FastModel<Channels>::_head_forward(float* output, int num_frames, A2FastChannelState* state)
+void A2FastModel<Channels>::_head_forward(float* output, const float* head_sum, int num_frames,
+                                         A2FastChannelState* state)
 {
   RingState& ring = state != nullptr ? state->head : _head_ring;
-  _head_ring_write(ring, num_frames);
+  _head_ring_write(ring, head_sum, num_frames);
 #if NAM_A2_RING_MODE == 1
   const int mask = ring.pow2_mask;
   auto col_of = [&](int f, int k) {
@@ -726,6 +762,252 @@ void A2FastModel<Channels>::prewarmChannelState(ChannelState& state)
 }
 
 template <int Channels>
+DSP::SharedBatchKernelDebugInfo A2FastModel<Channels>::GetSharedBatchKernelDebugInfo() const
+{
+  SharedBatchKernelDebugInfo info;
+  info.available = true;
+  info.mode = static_cast<SharedBatchKernelMode>(_last_batch_mode.load(std::memory_order_relaxed));
+  info.fallbackReason =
+    static_cast<SharedBatchFallbackReason>(_last_batch_fallback.load(std::memory_order_relaxed));
+  info.numChannels = _last_batch_channels.load(std::memory_order_relaxed);
+  info.minBatchChannels = Channels == 8 && kTurboBatchEnabled ? kTurboBatchMinChannels : 0;
+  info.maxBatchSize = _max_batch_size;
+  return info;
+}
+
+template <int Channels>
+void A2FastModel<Channels>::_resize_batch_scratch(int maxBatchSize)
+{
+  _max_batch_size = std::max(maxBatchSize, 0);
+  _batch_states.assign(static_cast<size_t>(_max_batch_size), nullptr);
+
+  if constexpr (Channels == 8)
+  {
+    const int max_frames = std::max(GetMaxBufferSize(), 1);
+    const size_t columns = static_cast<size_t>(max_frames) * static_cast<size_t>(_max_batch_size);
+    const size_t channel_values = static_cast<size_t>(Channels) * columns;
+
+    _batch_layer_in.assign(channel_values, 0.0f);
+    _batch_head_sum.assign(channel_values, 0.0f);
+    _batch_z.assign(channel_values, 0.0f);
+    _batch_cond.assign(columns, 0.0f);
+    _batch_head_out.assign(columns, 0.0f);
+    _batch_packed_history.assign(static_cast<size_t>(Channels) * 15u * columns, 0.0f);
+
+#if defined(__APPLE__)
+    // Exercise Accelerate off the audio thread so any one-time framework setup
+    // has happened before the first realtime turbo batch.
+    if (_max_batch_size >= kTurboBatchMinChannels && columns > 0)
+    {
+      const auto& layer = _layers[14]; // First fixed-shape K=15 layer.
+      cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                  Channels, static_cast<int>(columns), Channels * 15,
+                  1.0f,
+                  layer.conv_w.data(), Channels,
+                  _batch_packed_history.data(), Channels * 15,
+                  0.0f,
+                  _batch_z.data(), Channels);
+    }
+#endif
+  }
+}
+
+template <int Channels>
+void A2FastModel<Channels>::prepareBatch(int maxBatchSize)
+{
+  _resize_batch_scratch(maxBatchSize);
+}
+
+template <int Channels>
+template <int KernelSize>
+void A2FastModel<Channels>::_batch_layer_forward_k(Layer& layer, int layerIndex,
+                                                   int numFrames, int numChannels)
+{
+  static_assert(Channels == 8, "A2 turbo batching is only valid for the standard 8-channel shape");
+  constexpr int reduction = Channels * KernelSize;
+  const int packed_columns = numFrames * numChannels;
+
+  for (int lane = 0; lane < numChannels; ++lane)
+  {
+    auto& ring = _batch_states[static_cast<size_t>(lane)]->layers[static_cast<size_t>(layerIndex)];
+    const float* layer_input = _batch_layer_in.data()
+      + static_cast<size_t>(lane) * static_cast<size_t>(Channels) * static_cast<size_t>(numFrames);
+    _ring_write(layer, ring, layer_input, numFrames);
+
+    for (int frame = 0; frame < numFrames; ++frame)
+    {
+      const int column = lane * numFrames + frame;
+      float* packed = _batch_packed_history.data() + static_cast<size_t>(column) * reduction;
+      for (int tap = 0; tap < KernelSize; ++tap)
+      {
+        const int taps_back = KernelSize - 1 - tap;
+#if NAM_A2_RING_MODE == 1
+        const int tap_base = (ring.write_pos - numFrames - taps_back * layer.dilation) & ring.pow2_mask;
+#else
+        const int tap_base = ring.write_pos - numFrames - taps_back * layer.dilation;
+#endif
+        const float* source = ring.history.data()
+          + static_cast<size_t>(tap_base + frame) * Channels;
+        std::memcpy(packed + tap * Channels, source, sizeof(float) * Channels);
+      }
+    }
+  }
+
+#if defined(__APPLE__)
+  cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+              Channels, packed_columns, reduction,
+              1.0f,
+              layer.conv_w.data(), Channels,
+              _batch_packed_history.data(), reduction,
+              0.0f,
+              _batch_z.data(), Channels);
+#else
+  using WeightMatrix = Eigen::Matrix<float, Channels, Eigen::Dynamic>;
+  using InputMatrix = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic>;
+  using OutputMatrix = Eigen::Matrix<float, Channels, Eigen::Dynamic>;
+  Eigen::Map<const WeightMatrix> weights(layer.conv_w.data(), Channels, reduction);
+  Eigen::Map<const InputMatrix> packed(_batch_packed_history.data(), reduction, packed_columns);
+  Eigen::Map<OutputMatrix> output(_batch_z.data(), Channels, packed_columns);
+  output.noalias() = weights * packed;
+#endif
+
+  using MatCC = Eigen::Matrix<float, Channels, Channels>;
+  using MatCDyn = Eigen::Matrix<float, Channels, Eigen::Dynamic>;
+  using VecC = Eigen::Matrix<float, Channels, 1>;
+  using RowDyn = Eigen::Matrix<float, 1, Eigen::Dynamic>;
+  Eigen::Map<MatCDyn> batch_z(_batch_z.data(), Channels, packed_columns);
+  Eigen::Map<MatCDyn> batch_head(_batch_head_sum.data(), Channels, packed_columns);
+  Eigen::Map<const RowDyn> batch_condition(_batch_cond.data(), 1, packed_columns);
+  Eigen::Map<const VecC> conv_bias(layer.conv_b.data());
+  Eigen::Map<const VecC> mixin(layer.mixin_w.data());
+  batch_z.colwise() += conv_bias;
+  batch_z.noalias() += mixin * batch_condition;
+  batch_z = (batch_z.array() < 0.0f).select(batch_z.array() * kLeakySlope,
+                                           batch_z.array());
+  batch_head += batch_z;
+
+  Eigen::Map<const MatCC> residual_weights(layer.l1x1_w.data());
+  Eigen::Map<const VecC> residual_bias(layer.l1x1_b.data());
+  for (int lane = 0; lane < numChannels; ++lane)
+  {
+    const size_t lane_offset = static_cast<size_t>(lane) * Channels * static_cast<size_t>(numFrames);
+    Eigen::Map<MatCDyn> layer_input(_batch_layer_in.data() + lane_offset, Channels, numFrames);
+    Eigen::Map<const MatCDyn> z(_batch_z.data() + lane_offset, Channels, numFrames);
+    layer_input.noalias() += residual_weights * z;
+    layer_input.colwise() += residual_bias;
+  }
+}
+
+template <int Channels>
+void A2FastModel<Channels>::_process_batch_turbo(NAM_SAMPLE* const* monoInputs,
+                                                 NAM_SAMPLE* const* monoOutputs,
+                                                 int numFrames, int numChannels)
+{
+  static_assert(Channels == 8, "A2 turbo batching is only valid for the standard 8-channel shape");
+  const int packed_columns = numFrames * numChannels;
+
+  for (int lane = 0; lane < numChannels; ++lane)
+  {
+    const size_t lane_column = static_cast<size_t>(lane) * static_cast<size_t>(numFrames);
+    for (int frame = 0; frame < numFrames; ++frame)
+    {
+      const size_t column = lane_column + static_cast<size_t>(frame);
+      const float input = static_cast<float>(monoInputs[lane][frame]);
+      _batch_cond[column] = input;
+      float* layer_input = _batch_layer_in.data() + column * Channels;
+      for (int channel = 0; channel < Channels; ++channel)
+        layer_input[channel] = _rechannel_w[static_cast<size_t>(channel)] * input;
+    }
+  }
+
+  std::memset(_batch_head_sum.data(), 0,
+              static_cast<size_t>(packed_columns) * Channels * sizeof(float));
+
+  for (int layer_index = 0; layer_index < kNumLayers; ++layer_index)
+  {
+    auto& layer = _layers[static_cast<size_t>(layer_index)];
+    switch (layer.kernel_size)
+    {
+      case 6:
+        _batch_layer_forward_k<6>(layer, layer_index, numFrames, numChannels);
+        break;
+      case 15:
+        _batch_layer_forward_k<15>(layer, layer_index, numFrames, numChannels);
+        break;
+      default:
+        assert(false && "A2FastModel turbo batch received an unsupported kernel size");
+        return;
+    }
+  }
+
+  for (int lane = 0; lane < numChannels; ++lane)
+  {
+    const size_t lane_column = static_cast<size_t>(lane) * static_cast<size_t>(numFrames);
+    float* head_output = _batch_head_out.data() + lane_column;
+    const float* head_sum = _batch_head_sum.data() + lane_column * Channels;
+    _head_forward(head_output, head_sum, numFrames, _batch_states[static_cast<size_t>(lane)]);
+    for (int frame = 0; frame < numFrames; ++frame)
+      monoOutputs[lane][frame] = static_cast<NAM_SAMPLE>(head_output[frame]);
+  }
+}
+
+template <int Channels>
+void A2FastModel<Channels>::processBatchChannels(NAM_SAMPLE* const* monoInputs,
+                                                NAM_SAMPLE* const* monoOutputs,
+                                                int numFrames, ChannelState** states,
+                                                int numChannels)
+{
+  if (numChannels <= 0 || numFrames <= 0)
+    return;
+
+  _last_batch_channels.store(numChannels, std::memory_order_relaxed);
+
+  auto fail_closed = [&](SharedBatchFallbackReason reason) {
+    _last_batch_mode.store(static_cast<int>(SharedBatchKernelMode::inactive), std::memory_order_relaxed);
+    _last_batch_fallback.store(static_cast<int>(reason), std::memory_order_relaxed);
+    for (int lane = 0; lane < numChannels; ++lane)
+      if (monoOutputs[lane] != nullptr)
+        std::fill_n(monoOutputs[lane], numFrames, static_cast<NAM_SAMPLE>(0));
+  };
+
+  if (numChannels > _max_batch_size || numFrames > GetMaxBufferSize()
+      || static_cast<int>(_batch_states.size()) < numChannels)
+  {
+    assert(false && "A2FastModel batch was not prepared for the requested shape");
+    fail_closed(SharedBatchFallbackReason::scratchTooSmall);
+    return;
+  }
+
+  for (int lane = 0; lane < numChannels; ++lane)
+  {
+    if (monoInputs[lane] == nullptr || monoOutputs[lane] == nullptr || states[lane] == nullptr)
+    {
+      assert(false && "A2FastModel batch received an invalid lane");
+      fail_closed(SharedBatchFallbackReason::invalidState);
+      return;
+    }
+    _batch_states[static_cast<size_t>(lane)] = static_cast<A2FastChannelState*>(states[lane]);
+  }
+
+  _last_batch_fallback.store(static_cast<int>(SharedBatchFallbackReason::none), std::memory_order_relaxed);
+
+  if constexpr (Channels == 8 && kTurboBatchEnabled)
+  {
+    if (numChannels >= kTurboBatchMinChannels)
+    {
+      _last_batch_mode.store(static_cast<int>(SharedBatchKernelMode::turbo), std::memory_order_relaxed);
+      _process_batch_turbo(monoInputs, monoOutputs, numFrames, numChannels);
+      return;
+    }
+  }
+
+  // Explicit normal-kernel policy for A2 nano and narrow A2 standard groups.
+  // This is the measured fast path for those shapes, not a recovery fallback.
+  _last_batch_mode.store(static_cast<int>(SharedBatchKernelMode::direct), std::memory_order_relaxed);
+  DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+}
+
+template <int Channels>
 void A2FastModel<Channels>::processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames,
                                             A2FastChannelState* state)
 {
@@ -758,7 +1040,7 @@ void A2FastModel<Channels>::processInternal(NAM_SAMPLE** input, NAM_SAMPLE** out
 
   // Output.
   float* head_out = _head_out.data();
-  _head_forward(head_out, num_frames, state);
+  _head_forward(head_out, _head_sum.data(), num_frames, state);
   for (int f = 0; f < num_frames; f++)
     out0[f] = static_cast<NAM_SAMPLE>(head_out[f]);
 }

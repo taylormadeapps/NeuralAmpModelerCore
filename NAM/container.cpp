@@ -72,7 +72,9 @@ ContainerModel::ContainerModel(std::vector<Submodel> submodels, const double exp
   }
 
   // Default to full size (last submodel)
-  _active_index = _submodels.size() - 1;
+  const size_t default_index = _submodels.size() - 1;
+  _active_index = default_index;
+  _last_batch_index = default_index;
 }
 
 void ContainerModel::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames)
@@ -85,6 +87,13 @@ DSP::RuntimeImplementation ContainerModel::GetRuntimeImplementation() const
 {
   const size_t active_index = _active_index.load(std::memory_order_acquire);
   return _model_at(active_index).GetRuntimeImplementation();
+}
+
+DSP::SharedBatchKernelDebugInfo ContainerModel::GetSharedBatchKernelDebugInfo() const
+{
+  const size_t batch_index = _last_batch_index.load(std::memory_order_acquire);
+  assert(batch_index < _submodels.size());
+  return _model_at(batch_index).GetSharedBatchKernelDebugInfo();
 }
 
 std::unique_ptr<ChannelState> ContainerModel::createChannelState() const
@@ -120,13 +129,70 @@ void ContainerModel::prewarmChannelState(ChannelState& state)
 void ContainerModel::processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
                                           int numFrames, ChannelState** states, int numChannels)
 {
-  DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+  if (numChannels <= 0 || numFrames <= 0)
+    return;
+
+  // The field-proven path remains the default. Only a prepared A2Fast tier
+  // whose architecture-owned turbo threshold is met pays the state-unwrapping
+  // cost needed to enter its fused kernel.
+  if (_minimum_batch_forwarding_channels <= 0 || numChannels < _minimum_batch_forwarding_channels)
+  {
+    DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+    return;
+  }
+
+  assert(states != nullptr);
+  assert(static_cast<int>(_batch_submodel_states.size()) >= numChannels);
+
+  auto& first_state = static_cast<ContainerChannelState&>(*states[0]);
+  assert(first_state.submodel_state != nullptr);
+  assert(first_state.submodel_index < _submodels.size());
+  assert(first_state.submodel_index < _submodel_batch_forwarding_min_channels.size());
+
+  const size_t batch_index = first_state.submodel_index;
+  const int tier_min_channels = _submodel_batch_forwarding_min_channels[batch_index];
+  if (tier_min_channels <= 0 || numChannels < tier_min_channels)
+  {
+    DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+    return;
+  }
+
+  for (int lane = 0; lane < numChannels; ++lane)
+  {
+    assert(states[lane] != nullptr);
+    auto& container_state = static_cast<ContainerChannelState&>(*states[lane]);
+    assert(container_state.submodel_state != nullptr);
+    assert(container_state.submodel_index == batch_index);
+    _batch_submodel_states[static_cast<size_t>(lane)] = container_state.submodel_state.get();
+  }
+
+  _last_batch_index.store(batch_index, std::memory_order_relaxed);
+  _model_at(batch_index).processBatchChannels(monoInputs, monoOutputs, numFrames,
+                                              _batch_submodel_states.data(), numChannels);
 }
 
 void ContainerModel::prepareBatch(int maxBatchSize)
 {
-  for (auto& sm : _submodels)
-    sm.model->prepareBatch(maxBatchSize);
+  _batch_submodel_states.assign(static_cast<size_t>(std::max(maxBatchSize, 0)), nullptr);
+  _submodel_batch_forwarding_min_channels.assign(_submodels.size(), 0);
+  _minimum_batch_forwarding_channels = 0;
+
+  for (size_t index = 0; index < _submodels.size(); ++index)
+  {
+    auto& model = *_submodels[index].model;
+    model.prepareBatch(maxBatchSize);
+
+    if (model.GetRuntimeImplementation() != DSP::RuntimeImplementation::a2Fast)
+      continue;
+
+    const int min_channels = model.GetSharedBatchKernelDebugInfo().minBatchChannels;
+    if (min_channels <= 0)
+      continue;
+
+    _submodel_batch_forwarding_min_channels[index] = min_channels;
+    if (_minimum_batch_forwarding_channels == 0 || min_channels < _minimum_batch_forwarding_channels)
+      _minimum_batch_forwarding_channels = min_channels;
+  }
 }
 
 void ContainerModel::prewarm()

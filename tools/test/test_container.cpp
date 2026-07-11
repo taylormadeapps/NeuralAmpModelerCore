@@ -70,12 +70,44 @@ public:
     channel_state_prewarm_count++;
   }
 
+  void processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                            int numFrames, nam::ChannelState** states, int numChannels) override
+  {
+    (void)monoInputs;
+    (void)states;
+    batch_process_count++;
+    last_batch_channels = numChannels;
+    for (int lane = 0; lane < numChannels; ++lane)
+      std::fill_n(monoOutputs[lane], numFrames, process_value);
+  }
+
+  void prepareBatch(int maxBatchSize) override
+  {
+    prepare_batch_count++;
+    prepared_batch_size = maxBatchSize;
+  }
+
+  SharedBatchKernelDebugInfo GetSharedBatchKernelDebugInfo() const override
+  {
+    SharedBatchKernelDebugInfo info;
+    info.available = true;
+    info.mode = SharedBatchKernelMode::turbo;
+    info.numChannels = last_batch_channels;
+    info.minBatchChannels = 2;
+    info.maxBatchSize = prepared_batch_size;
+    return info;
+  }
+
   const NAM_SAMPLE process_value;
   int reset_count = 0;
   int prewarm_count = 0;
   int process_count = 0;
   mutable int channel_state_create_count = 0;
   int channel_state_prewarm_count = 0;
+  int batch_process_count = 0;
+  int prepare_batch_count = 0;
+  int prepared_batch_size = 0;
+  int last_batch_channels = 0;
   double reset_sample_rate = 0.0;
   int reset_buffer_size = 0;
   std::function<void()> on_reset;
@@ -519,6 +551,87 @@ void test_container_external_state_is_bound_to_its_submodel()
   output = (NAM_SAMPLE)-1.0;
   dsp->processChannel(&input_ptr, &output_ptr, 1, *small_state);
   assert(output == small->process_value);
+}
+
+void test_container_keeps_generic_batches_on_direct_bound_state_path()
+{
+  CountingDSP* small = nullptr;
+  CountingDSP* large = nullptr;
+  auto dsp = build_counting_container(small, large);
+  dsp->Reset(48000.0, 64);
+  dsp->prepareBatch(2);
+  assert(small->prepare_batch_count == 1);
+  assert(large->prepare_batch_count == 1);
+  assert(small->prepared_batch_size == 2);
+  assert(large->prepared_batch_size == 2);
+
+  auto state_a = dsp->createChannelState();
+  auto state_b = dsp->createChannelState();
+  assert(state_a != nullptr);
+  assert(state_b != nullptr);
+
+  auto* slimmable = dynamic_cast<nam::SlimmableModel*>(dsp.get());
+  assert(slimmable != nullptr);
+  slimmable->SetSlimmableSize(0.0);
+
+  NAM_SAMPLE input_a[4]{};
+  NAM_SAMPLE input_b[4]{};
+  NAM_SAMPLE output_a[4]{};
+  NAM_SAMPLE output_b[4]{};
+  NAM_SAMPLE* inputs[] = {input_a, input_b};
+  NAM_SAMPLE* outputs[] = {output_a, output_b};
+  nam::ChannelState* states[] = {state_a.get(), state_b.get()};
+  dsp->processBatchChannels(inputs, outputs, 4, states, 2);
+
+  assert(small->batch_process_count == 0);
+  assert(large->batch_process_count == 0);
+  assert(large->process_count == 2);
+  for (int frame = 0; frame < 4; ++frame)
+  {
+    assert(output_a[frame] == large->process_value);
+    assert(output_b[frame] == large->process_value);
+  }
+
+}
+
+void test_container_forwards_only_a2fast_turbo_batches()
+{
+  constexpr int num_channels = 8;
+  constexpr int num_frames = 128;
+
+  auto dsp = nam::get_dsp(std::filesystem::path("example_models/A2.nam"));
+  dsp->Reset(48000.0, num_frames);
+  dsp->prepareBatch(num_channels);
+
+  std::vector<std::unique_ptr<nam::ChannelState>> owned_states;
+  std::vector<nam::ChannelState*> states(num_channels, nullptr);
+  std::vector<std::vector<NAM_SAMPLE>> inputs(
+    num_channels, std::vector<NAM_SAMPLE>(num_frames, static_cast<NAM_SAMPLE>(0.01)));
+  std::vector<std::vector<NAM_SAMPLE>> outputs(
+    num_channels, std::vector<NAM_SAMPLE>(num_frames, static_cast<NAM_SAMPLE>(0)));
+  std::vector<NAM_SAMPLE*> input_ptrs(num_channels, nullptr);
+  std::vector<NAM_SAMPLE*> output_ptrs(num_channels, nullptr);
+
+  owned_states.reserve(num_channels);
+  for (int lane = 0; lane < num_channels; ++lane)
+  {
+    auto state = dsp->createChannelState();
+    assert(state != nullptr);
+    dsp->prewarmChannelState(*state);
+    states[(size_t)lane] = state.get();
+    owned_states.push_back(std::move(state));
+    input_ptrs[(size_t)lane] = inputs[(size_t)lane].data();
+    output_ptrs[(size_t)lane] = outputs[(size_t)lane].data();
+  }
+
+  dsp->processBatchChannels(input_ptrs.data(), output_ptrs.data(), num_frames,
+                            states.data(), num_channels);
+
+  const auto debug = dsp->GetSharedBatchKernelDebugInfo();
+  assert(debug.available);
+  assert(debug.mode == nam::DSP::SharedBatchKernelMode::turbo);
+  assert(debug.numChannels == num_channels);
+  assert(debug.minBatchChannels == num_channels);
 }
 
 void test_container_external_state_matches_standalone_at_every_a2_tier()
