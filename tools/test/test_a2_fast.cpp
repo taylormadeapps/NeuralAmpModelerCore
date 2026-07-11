@@ -148,6 +148,51 @@ std::vector<NAM_SAMPLE> run_dsp(nam::DSP& dsp, const std::vector<NAM_SAMPLE>& in
   return out;
 }
 
+std::vector<NAM_SAMPLE> run_dsp_blocks(nam::DSP& dsp, const std::vector<NAM_SAMPLE>& input,
+                                       const std::vector<int>& block_sizes)
+{
+  std::vector<NAM_SAMPLE> out(input.size(), static_cast<NAM_SAMPLE>(0));
+  int pos = 0;
+  int block_index = 0;
+  const int total = static_cast<int>(input.size());
+  while (pos < total)
+  {
+    const int block_size = block_sizes[static_cast<size_t>(block_index % static_cast<int>(block_sizes.size()))];
+    const int n = std::min(block_size, total - pos);
+    const NAM_SAMPLE* in_ptr = input.data() + pos;
+    NAM_SAMPLE* out_ptr = out.data() + pos;
+    const NAM_SAMPLE* in_arr[] = {in_ptr};
+    NAM_SAMPLE* out_arr[] = {out_ptr};
+    dsp.process(const_cast<NAM_SAMPLE**>(in_arr), out_arr, n);
+    pos += n;
+    block_index++;
+  }
+  return out;
+}
+
+std::vector<NAM_SAMPLE> run_dsp_channel_state_blocks(nam::DSP& dsp, nam::ChannelState& state,
+                                                     const std::vector<NAM_SAMPLE>& input,
+                                                     const std::vector<int>& block_sizes)
+{
+  std::vector<NAM_SAMPLE> out(input.size(), static_cast<NAM_SAMPLE>(0));
+  int pos = 0;
+  int block_index = 0;
+  const int total = static_cast<int>(input.size());
+  while (pos < total)
+  {
+    const int block_size = block_sizes[static_cast<size_t>(block_index % static_cast<int>(block_sizes.size()))];
+    const int n = std::min(block_size, total - pos);
+    const NAM_SAMPLE* in_ptr = input.data() + pos;
+    NAM_SAMPLE* out_ptr = out.data() + pos;
+    const NAM_SAMPLE* in_arr[] = {in_ptr};
+    NAM_SAMPLE* out_arr[] = {out_ptr};
+    dsp.processChannel(const_cast<NAM_SAMPLE**>(in_arr), out_arr, n, state);
+    pos += n;
+    block_index++;
+  }
+  return out;
+}
+
 void compare(const std::vector<NAM_SAMPLE>& a, const std::vector<NAM_SAMPLE>& b, int channels, int block_size,
              double tol)
 {
@@ -168,6 +213,31 @@ void compare(const std::vector<NAM_SAMPLE>& a, const std::vector<NAM_SAMPLE>& b,
     std::cerr << "A2FastModel<" << channels << "> diverges from generic WaveNet "
               << "(block=" << block_size << "): max |diff| = " << max_diff << " at i=" << max_i
               << " (generic=" << a[max_i] << ", fast=" << b[max_i] << ")" << std::endl;
+    assert(false);
+  }
+}
+
+void compare_channel_state(const std::vector<NAM_SAMPLE>& standalone, const std::vector<NAM_SAMPLE>& shared,
+                           int channels, double tol)
+{
+  assert(standalone.size() == shared.size());
+  double max_diff = 0.0;
+  int max_i = 0;
+  for (size_t i = 0; i < standalone.size(); i++)
+  {
+    const double d = std::fabs(static_cast<double>(standalone[i]) - static_cast<double>(shared[i]));
+    if (d > max_diff)
+    {
+      max_diff = d;
+      max_i = static_cast<int>(i);
+    }
+  }
+  if (!(max_diff < tol))
+  {
+    std::cerr << "A2FastModel<" << channels
+              << "> external ChannelState diverges from standalone process: max |diff| = " << max_diff
+              << " at i=" << max_i << " (standalone=" << standalone[max_i] << ", shared=" << shared[max_i]
+              << ")" << std::endl;
     assert(false);
   }
 }
@@ -268,6 +338,124 @@ void test_matches_generic_standard()
   test_matches_generic(8);
 }
 
+void test_channel_state_matches_standalone(int channels)
+{
+  const auto cfg = build_a2_config(channels);
+  const int weight_count = a2_weight_count(channels);
+  const auto weights = make_deterministic_weights(weight_count, /*seed=*/0xA250000u + channels);
+
+  auto standalone_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+  std::vector<float> w_standalone = weights;
+  auto standalone_dsp = standalone_cfg->create(std::move(w_standalone), 48000.0);
+
+  auto shared_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+  std::vector<float> w_shared = weights;
+  auto shared_dsp = shared_cfg->create(std::move(w_shared), 48000.0);
+
+  const int max_buffer = 256;
+  standalone_dsp->Reset(48000.0, max_buffer);
+  shared_dsp->Reset(48000.0, max_buffer);
+
+  auto shared_state = shared_dsp->createChannelState();
+  assert(shared_state);
+  shared_dsp->prewarmChannelState(*shared_state);
+
+  const int total = 4096;
+  const auto input = make_test_input(total, 48000.0);
+  const std::vector<int> block_sizes = {7, 64, 3, 128, 255, 11};
+
+  const auto out_standalone = run_dsp_blocks(*standalone_dsp, input, block_sizes);
+  const auto out_shared = run_dsp_channel_state_blocks(*shared_dsp, *shared_state, input, block_sizes);
+  compare_channel_state(out_standalone, out_shared, channels, /*tol=*/1e-6);
+}
+
+void test_channel_state_matches_standalone_nano()
+{
+  test_channel_state_matches_standalone(3);
+}
+
+void test_channel_state_matches_standalone_standard()
+{
+  test_channel_state_matches_standalone(8);
+}
+
+void test_batch_channel_states_are_isolated(int channels)
+{
+  const auto cfg = build_a2_config(channels);
+  const int weight_count = a2_weight_count(channels);
+  const auto weights = make_deterministic_weights(weight_count, /*seed=*/0xA2BA700u + channels);
+
+  auto create_dsp = [&]() {
+    auto model_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+    std::vector<float> model_weights = weights;
+    return model_cfg->create(std::move(model_weights), 48000.0);
+  };
+
+  auto reference_a = create_dsp();
+  auto reference_b = create_dsp();
+  auto shared = create_dsp();
+
+  constexpr int max_buffer = 256;
+  reference_a->Reset(48000.0, max_buffer);
+  reference_b->Reset(48000.0, max_buffer);
+  shared->Reset(48000.0, max_buffer);
+
+  auto state_a = shared->createChannelState();
+  auto state_b = shared->createChannelState();
+  assert(state_a != nullptr);
+  assert(state_b != nullptr);
+  shared->prewarmChannelState(*state_a);
+  shared->prewarmChannelState(*state_b);
+  shared->prepareBatch(2);
+
+  constexpr int total = 2048;
+  auto input_a = make_test_input(total, 48000.0);
+  auto input_b = make_test_input(total, 44100.0);
+  for (int i = 0; i < total; ++i)
+    input_b[static_cast<size_t>(i)] = (NAM_SAMPLE)(-0.7 * input_b[static_cast<size_t>(i)] + 0.01);
+
+  std::vector<NAM_SAMPLE> reference_output_a(total, (NAM_SAMPLE)0.0);
+  std::vector<NAM_SAMPLE> reference_output_b(total, (NAM_SAMPLE)0.0);
+  std::vector<NAM_SAMPLE> shared_output_a(total, (NAM_SAMPLE)0.0);
+  std::vector<NAM_SAMPLE> shared_output_b(total, (NAM_SAMPLE)0.0);
+
+  const std::vector<int> block_sizes = {17, 64, 128, 255, 9};
+  int pos = 0;
+  int block_index = 0;
+  while (pos < total)
+  {
+    const int n = std::min(block_sizes[static_cast<size_t>(block_index % block_sizes.size())], total - pos);
+
+    NAM_SAMPLE* ref_in_a[] = {input_a.data() + pos};
+    NAM_SAMPLE* ref_in_b[] = {input_b.data() + pos};
+    NAM_SAMPLE* ref_out_a[] = {reference_output_a.data() + pos};
+    NAM_SAMPLE* ref_out_b[] = {reference_output_b.data() + pos};
+    reference_a->process(ref_in_a, ref_out_a, n);
+    reference_b->process(ref_in_b, ref_out_b, n);
+
+    NAM_SAMPLE* batch_inputs[] = {input_a.data() + pos, input_b.data() + pos};
+    NAM_SAMPLE* batch_outputs[] = {shared_output_a.data() + pos, shared_output_b.data() + pos};
+    nam::ChannelState* states[] = {state_a.get(), state_b.get()};
+    shared->processBatchChannels(batch_inputs, batch_outputs, n, states, 2);
+
+    pos += n;
+    block_index++;
+  }
+
+  compare_channel_state(reference_output_a, shared_output_a, channels, /*tol=*/1e-6);
+  compare_channel_state(reference_output_b, shared_output_b, channels, /*tol=*/1e-6);
+}
+
+void test_batch_channel_states_are_isolated_nano()
+{
+  test_batch_channel_states_are_isolated(3);
+}
+
+void test_batch_channel_states_are_isolated_standard()
+{
+  test_batch_channel_states_are_isolated(8);
+}
+
 // Real-time safety: once the DSP has been Reset (buffers sized, prewarmed),
 // subsequent process() calls must not allocate or free heap memory. Uses the
 // same allocation-tracking infrastructure as the generic WaveNet RT-safety
@@ -331,6 +519,66 @@ void test_process_realtime_safe_nano()
 void test_process_realtime_safe_standard()
 {
   test_process_realtime_safe(8);
+}
+
+void test_process_channel_realtime_safe(int channels)
+{
+  const auto cfg = build_a2_config(channels);
+  const int weight_count = a2_weight_count(channels);
+  const auto weights = make_deterministic_weights(weight_count, /*seed=*/0xA2FA500u + channels);
+
+  auto fast_cfg = nam::wavenet::a2_fast::create_a2_fast_config(cfg, 48000.0);
+  std::vector<float> w_fast = weights;
+  auto fast_dsp = fast_cfg->create(std::move(w_fast), 48000.0);
+
+  const int max_buffer = 256;
+  fast_dsp->Reset(48000.0, max_buffer);
+  auto state = fast_dsp->createChannelState();
+  assert(state);
+  fast_dsp->prewarmChannelState(*state);
+
+  const int total = 4 * max_buffer;
+  const auto input = make_test_input(total, 48000.0);
+  std::vector<NAM_SAMPLE> output(total, 0.0);
+
+  {
+    const NAM_SAMPLE* in = input.data();
+    NAM_SAMPLE* out = output.data();
+    const NAM_SAMPLE* in_arr[] = {in};
+    NAM_SAMPLE* out_arr[] = {out};
+    fast_dsp->processChannel(const_cast<NAM_SAMPLE**>(in_arr), out_arr, max_buffer, *state);
+  }
+
+  for (int block : {1, 32, 64, 128, 256})
+  {
+    std::string test_name =
+      "A2FastModel<" + std::to_string(channels) + ">::processChannel block=" + std::to_string(block);
+    allocation_tracking::run_allocation_test_no_allocations(
+      nullptr,
+      [&]() {
+        int pos = 0;
+        while (pos + block <= total)
+        {
+          const NAM_SAMPLE* in = input.data() + pos;
+          NAM_SAMPLE* out = output.data() + pos;
+          const NAM_SAMPLE* in_arr[] = {in};
+          NAM_SAMPLE* out_arr[] = {out};
+          fast_dsp->processChannel(const_cast<NAM_SAMPLE**>(in_arr), out_arr, block, *state);
+          pos += block;
+        }
+      },
+      nullptr, test_name.c_str());
+  }
+}
+
+void test_process_channel_realtime_safe_nano()
+{
+  test_process_channel_realtime_safe(3);
+}
+
+void test_process_channel_realtime_safe_standard()
+{
+  test_process_channel_realtime_safe(8);
 }
 
 } // namespace test_a2_fast

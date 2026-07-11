@@ -20,6 +20,10 @@ namespace test_container
 class CountingDSP : public nam::DSP
 {
 public:
+  struct State : public nam::ChannelState
+  {
+  };
+
   explicit CountingDSP(NAM_SAMPLE process_value)
   : DSP(1, 1, 48000.0)
   , process_value(process_value)
@@ -47,10 +51,31 @@ public:
       output[0][i] = process_value;
   }
 
+  std::unique_ptr<nam::ChannelState> createChannelState() const override
+  {
+    channel_state_create_count++;
+    return std::make_unique<State>();
+  }
+
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                      nam::ChannelState& state) override
+  {
+    (void)state;
+    process(input, output, num_frames);
+  }
+
+  void prewarmChannelState(nam::ChannelState& state) override
+  {
+    (void)state;
+    channel_state_prewarm_count++;
+  }
+
   const NAM_SAMPLE process_value;
   int reset_count = 0;
   int prewarm_count = 0;
   int process_count = 0;
+  mutable int channel_state_create_count = 0;
+  int channel_state_prewarm_count = 0;
   double reset_sample_rate = 0.0;
   int reset_buffer_size = 0;
   std::function<void()> on_reset;
@@ -78,6 +103,29 @@ NAM_SAMPLE process_one_sample(nam::DSP* dsp)
   NAM_SAMPLE* in_ptr = &input;
   NAM_SAMPLE* out_ptr = &output;
   dsp->process(&in_ptr, &out_ptr, 1);
+  return output;
+}
+
+std::vector<NAM_SAMPLE> process_blocks(nam::DSP& dsp, nam::ChannelState* state,
+                                       const std::vector<NAM_SAMPLE>& input,
+                                       const std::vector<int>& block_sizes)
+{
+  std::vector<NAM_SAMPLE> output(input.size(), (NAM_SAMPLE)0.0);
+  int position = 0;
+  int block_index = 0;
+  while (position < (int)input.size())
+  {
+    const int requested = block_sizes[(size_t)(block_index % (int)block_sizes.size())];
+    const int num_frames = std::min(requested, (int)input.size() - position);
+    NAM_SAMPLE* input_ptr = const_cast<NAM_SAMPLE*>(input.data() + position);
+    NAM_SAMPLE* output_ptr = output.data() + position;
+    if (state == nullptr)
+      dsp.process(&input_ptr, &output_ptr, num_frames);
+    else
+      dsp.processChannel(&input_ptr, &output_ptr, num_frames, *state);
+    position += num_frames;
+    block_index++;
+  }
   return output;
 }
 
@@ -412,7 +460,7 @@ void test_container_default_is_max_size()
     assert(std::abs(out_default[i] - out_max[i]) < 1e-6);
 }
 
-void test_container_reset_only_resets_active_submodel()
+void test_container_reset_prepares_every_submodel_and_prewarms_only_active()
 {
   CountingDSP* small = nullptr;
   CountingDSP* large = nullptr;
@@ -420,13 +468,93 @@ void test_container_reset_only_resets_active_submodel()
 
   dsp->Reset(44100.0, 128);
 
-  assert(small->reset_count == 0);
+  assert(small->reset_count == 1);
   assert(small->prewarm_count == 0);
+  assert(small->reset_sample_rate == 44100.0);
+  assert(small->reset_buffer_size == 128);
 
   assert(large->reset_count == 1);
   assert(large->prewarm_count == 1);
   assert(large->reset_sample_rate == 44100.0);
   assert(large->reset_buffer_size == 128);
+}
+
+void test_container_external_state_is_bound_to_its_submodel()
+{
+  CountingDSP* small = nullptr;
+  CountingDSP* large = nullptr;
+  auto dsp = build_counting_container(small, large);
+  dsp->Reset(48000.0, 64);
+
+  auto large_state = dsp->createChannelState();
+  assert(large_state != nullptr);
+  dsp->prewarmChannelState(*large_state);
+  assert(small->channel_state_create_count == 0);
+  assert(large->channel_state_create_count == 1);
+  assert(small->channel_state_prewarm_count == 0);
+  assert(large->channel_state_prewarm_count == 1);
+
+  auto* slimmable = dynamic_cast<nam::SlimmableModel*>(dsp.get());
+  assert(slimmable != nullptr);
+  slimmable->SetSlimmableSize(0.0);
+
+  auto small_state = dsp->createChannelState();
+  assert(small_state != nullptr);
+  dsp->prewarmChannelState(*small_state);
+  assert(small->channel_state_create_count == 1);
+  assert(large->channel_state_create_count == 1);
+  assert(small->channel_state_prewarm_count == 1);
+  assert(large->channel_state_prewarm_count == 1);
+
+  NAM_SAMPLE input = (NAM_SAMPLE)0.0;
+  NAM_SAMPLE output = (NAM_SAMPLE)-1.0;
+  NAM_SAMPLE* input_ptr = &input;
+  NAM_SAMPLE* output_ptr = &output;
+
+  // The large state remains attached to the large model even though the
+  // container's standalone active tier is now small.
+  dsp->processChannel(&input_ptr, &output_ptr, 1, *large_state);
+  assert(output == large->process_value);
+
+  output = (NAM_SAMPLE)-1.0;
+  dsp->processChannel(&input_ptr, &output_ptr, 1, *small_state);
+  assert(output == small->process_value);
+}
+
+void test_container_external_state_matches_standalone_at_every_a2_tier()
+{
+  constexpr int max_buffer_size = 256;
+  constexpr int total_frames = 2048;
+  std::vector<NAM_SAMPLE> input(total_frames);
+  for (int i = 0; i < total_frames; ++i)
+    input[(size_t)i] = (NAM_SAMPLE)(0.2 * std::sin(2.0 * M_PI * 317.0 * i / 48000.0)
+                                    + 0.07 * std::sin(2.0 * M_PI * 1291.0 * i / 48000.0));
+
+  const std::vector<int> block_sizes = {7, 64, 3, 128, 255, 11};
+  for (const double slimmable_size : {0.0, 1.0})
+  {
+    auto standalone = nam::get_dsp(std::filesystem::path("example_models/A2.nam"));
+    auto shared = nam::get_dsp(std::filesystem::path("example_models/A2.nam"));
+    auto* standalone_slimmable = dynamic_cast<nam::SlimmableModel*>(standalone.get());
+    auto* shared_slimmable = dynamic_cast<nam::SlimmableModel*>(shared.get());
+    assert(standalone_slimmable != nullptr);
+    assert(shared_slimmable != nullptr);
+
+    standalone_slimmable->SetSlimmableSize(slimmable_size);
+    shared_slimmable->SetSlimmableSize(slimmable_size);
+    standalone->Reset(48000.0, max_buffer_size);
+    shared->Reset(48000.0, max_buffer_size);
+
+    auto state = shared->createChannelState();
+    assert(state != nullptr);
+    shared->prewarmChannelState(*state);
+
+    const auto standalone_output = process_blocks(*standalone, nullptr, input, block_sizes);
+    const auto shared_output = process_blocks(*shared, state.get(), input, block_sizes);
+    assert(standalone_output.size() == shared_output.size());
+    for (size_t i = 0; i < standalone_output.size(); ++i)
+      assert(std::abs(standalone_output[i] - shared_output[i]) < 1e-6);
+  }
 }
 
 void test_container_switch_resets_before_activation()
@@ -443,7 +571,10 @@ void test_container_switch_resets_before_activation()
   assert(slimmable != nullptr);
   slimmable->SetSlimmableSize(0.0);
 
-  assert(small->reset_count == 1);
+  assert(small->reset_count == 2);
+  assert(small->prewarm_count == 1);
+  assert(small->reset_sample_rate == 48000.0);
+  assert(small->reset_buffer_size == 64);
   assert(value_during_reset == large->process_value);
   assert(process_one_sample(dsp.get()) == small->process_value);
 }

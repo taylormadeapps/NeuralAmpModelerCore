@@ -222,6 +222,7 @@ int main()
   test_wavenet::test_process_3in_2out_realtime_safe();
   test_wavenet::test_condition_processing::test_with_condition_dsp();
   test_wavenet::test_condition_processing::test_with_condition_dsp_multichannel();
+  test_wavenet::test_condition_processing::test_condition_dsp_external_state_is_all_or_nothing();
 
   test_convnet::test_convnet_basic();
   test_convnet::test_convnet_batchnorm();
@@ -319,7 +320,9 @@ int main()
   test_container::test_container_sample_rate_mismatch_throws();
   test_container::test_container_load_from_file();
   test_container::test_container_default_is_max_size();
-  test_container::test_container_reset_only_resets_active_submodel();
+  test_container::test_container_reset_prepares_every_submodel_and_prewarms_only_active();
+  test_container::test_container_external_state_is_bound_to_its_submodel();
+  test_container::test_container_external_state_matches_standalone_at_every_a2_tier();
   test_container::test_container_switch_resets_before_activation();
 
   // Render --slim tests
@@ -353,8 +356,14 @@ int main()
   test_a2_fast::test_detector_rejects_gating();
   test_a2_fast::test_matches_generic_nano();
   test_a2_fast::test_matches_generic_standard();
+  test_a2_fast::test_channel_state_matches_standalone_nano();
+  test_a2_fast::test_channel_state_matches_standalone_standard();
+  test_a2_fast::test_batch_channel_states_are_isolated_nano();
+  test_a2_fast::test_batch_channel_states_are_isolated_standard();
   test_a2_fast::test_process_realtime_safe_nano();
   test_a2_fast::test_process_realtime_safe_standard();
+  test_a2_fast::test_process_channel_realtime_safe_nano();
+  test_a2_fast::test_process_channel_realtime_safe_standard();
 #endif
 
   std::cout << "Success!" << std::endl;

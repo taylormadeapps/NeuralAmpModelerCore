@@ -4,6 +4,7 @@
 #include <map>
 #include <vector>
 #include <memory>
+#include <atomic>
 
 #include <Eigen/Dense>
 
@@ -13,6 +14,21 @@ namespace nam
 {
 namespace lstm
 {
+
+// =============================================================================
+// Per-channel state structs — separated from weights for shared-weight
+// multi-channel processing. One state per audio channel; the LSTMCell / LSTM
+// classes hold the shared (immutable after load) weight matrices.
+// =============================================================================
+
+/// \brief Mutable per-channel state for a single LSTM cell.
+struct LSTMCellState
+{
+  Eigen::VectorXf _xh;    ///< Concatenated input + hidden state
+  Eigen::VectorXf _ifgo;  ///< Gate activations (scratch — recomputed each sample)
+  Eigen::VectorXf _c;     ///< Cell state
+};
+
 /// \brief A single LSTM cell
 class LSTMCell
 {
@@ -25,11 +41,33 @@ public:
 
   /// \brief Get the current hidden state
   /// \return Hidden state vector
-  Eigen::VectorXf get_hidden_state() const { return this->_xh(Eigen::placeholders::lastN(this->_get_hidden_size())); };
+  Eigen::Ref<const Eigen::VectorXf> get_hidden_state() const
+  {
+    return this->_xh.tail(this->_get_hidden_size());
+  };
 
   /// \brief Process a single input vector
   /// \param x Input vector
-  void process_(const Eigen::VectorXf& x);
+  void process_(const Eigen::Ref<const Eigen::VectorXf>& x);
+
+  // --- Shared-weight multi-channel API ----------------------------------------
+
+  /// \brief Create a fresh per-channel state from initial conditions.
+  LSTMCellState createState() const;
+
+  /// \brief Process using shared weights (this) and external per-channel state.
+  void process_(const Eigen::VectorXf& x, LSTMCellState& state) const;
+
+  /// \brief Get hidden state from external per-channel state.
+  Eigen::VectorXf get_hidden_state(const LSTMCellState& state) const
+  {
+    return state._xh(Eigen::placeholders::lastN(this->_get_hidden_size()));
+  }
+
+  /// \brief Batched processing: N channels' _xh vectors → one GEMM → per-channel gate updates.
+  /// batch_xh and batch_ifgo must be pre-allocated to at least (rows × N) columns.
+  void processBatch_(Eigen::MatrixXf& batch_xh, Eigen::MatrixXf& batch_ifgo,
+                     LSTMCellState** states, int N) const;
 
 private:
   // Parameters
@@ -47,8 +85,24 @@ private:
   // Cell state
   Eigen::VectorXf _c;
 
+  // Initial state templates (saved from constructor for cloning to new channels)
+  Eigen::VectorXf _initial_xh;
+  Eigen::VectorXf _initial_c;
+
   long _get_hidden_size() const { return this->_b.size() / 4; };
   long _get_input_size() const { return this->_xh.size() - this->_get_hidden_size(); };
+
+  // Allow LSTM to access _w dimensions for batch scratch allocation.
+  friend class LSTM;
+};
+
+/// \brief Mutable per-channel state for a complete LSTM model.
+/// One of these per audio channel; the LSTM class holds the shared weights.
+struct LSTMChannelState : public ChannelState
+{
+  std::vector<LSTMCellState> layers;
+  Eigen::VectorXf _input;
+  Eigen::VectorXf _output;
 };
 
 /// \brief A multi-layer LSTM model
@@ -58,6 +112,32 @@ private:
 class LSTM : public DSP
 {
 public:
+  static constexpr int kTurboBatchMinChannels = 8;
+
+  enum class BatchKernelMode : int
+  {
+    inactive = 0,
+    directSequential = 1,
+    packedSmallBatch = 2,
+    turboBatch = 3,
+  };
+
+  enum class BatchKernelFallbackReason : int
+  {
+    none = 0,
+    belowTurboThreshold = 1,
+    batchScratchTooSmall = 2,
+  };
+
+  struct BatchKernelDebugInfo
+  {
+    BatchKernelMode mode = BatchKernelMode::inactive;
+    BatchKernelFallbackReason fallbackReason = BatchKernelFallbackReason::none;
+    int numChannels = 0;
+    int turboMinChannels = kTurboBatchMinChannels;
+    int maxBatchSize = 0;
+  };
+
   /// \brief Constructor
   /// \param in_channels Number of input channels
   /// \param out_channels Number of output channels
@@ -78,6 +158,26 @@ public:
   /// \param num_frames Number of frames to process
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
 
+  LSTMChannelState createTypedChannelState() const;
+  void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, LSTMChannelState& state) const;
+  void prewarmTypedChannelState(LSTMChannelState& state) const;
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
+  void processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                            int numFrames, ChannelState** states, int numChannels) override;
+  void prepareBatch(int maxBatchSize) override;
+  BatchKernelDebugInfo getLastBatchKernelDebugInfo() const
+  {
+    BatchKernelDebugInfo info;
+    info.mode = static_cast<BatchKernelMode>(_lastBatchKernelMode.load(std::memory_order_relaxed));
+    info.fallbackReason = static_cast<BatchKernelFallbackReason>(
+        _lastBatchKernelFallbackReason.load(std::memory_order_relaxed));
+    info.numChannels = _lastBatchKernelChannels.load(std::memory_order_relaxed);
+    info.maxBatchSize = _max_batch_size;
+    return info;
+  }
+
   int GetPrewarmSamples() override;
 
   Eigen::MatrixXf _head_weight; // (out_channels x hidden_size)
@@ -85,12 +185,47 @@ public:
   std::vector<LSTMCell> _layers;
 
   void _process_sample();
+  void _process_sample(LSTMChannelState& state) const;
 
   // Input to the LSTM.
   // Since this is assumed to not be a parametric model, its shape should be (in_channels,)
   Eigen::VectorXf _input;
   // Output from _process_sample - multi-channel output vector (size out_channels)
   Eigen::VectorXf _output;
+
+  // Batch scratch matrices for N-channel processing (pre-allocated on message thread).
+  // Per-layer: one pair of (xh, ifgo) matrices sized for the layer's dimensions.
+  struct BatchLayerScratch
+  {
+    Eigen::MatrixXf xh;    // (dx+dh × max_batch)
+    Eigen::MatrixXf ifgo;  // (4*dh × max_batch)
+    Eigen::MatrixXf i;     // (dh × max_batch)
+    Eigen::MatrixXf f;     // (dh × max_batch)
+    Eigen::MatrixXf g;     // (dh × max_batch)
+    Eigen::MatrixXf o;     // (dh × max_batch)
+    Eigen::MatrixXf c;     // (dh × max_batch)
+    Eigen::MatrixXf h;     // (dh × max_batch)
+  };
+  std::vector<BatchLayerScratch> _batch_layer_scratch;
+  Eigen::MatrixXf _batch_hidden;  // (dh x max_batch) - last layer hidden states
+  Eigen::MatrixXf _batch_output;  // (out_ch x max_batch) - head projection result
+  std::vector<LSTMChannelState*> _batch_channel_state_ptrs;
+  std::vector<LSTMCellState*> _batch_cell_state_ptrs;
+  int _max_batch_size = 0;
+  std::atomic<int> _lastBatchKernelMode { static_cast<int>(BatchKernelMode::inactive) };
+  std::atomic<int> _lastBatchKernelFallbackReason { static_cast<int>(BatchKernelFallbackReason::none) };
+  std::atomic<int> _lastBatchKernelChannels { 0 };
+
+  void processSmallBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                                 int numFrames, LSTMChannelState** states, int numChannels);
+  void setLastBatchKernelDebugInfo(BatchKernelMode mode,
+                                   BatchKernelFallbackReason fallbackReason,
+                                   int numChannels)
+  {
+    _lastBatchKernelMode.store(static_cast<int>(mode), std::memory_order_relaxed);
+    _lastBatchKernelFallbackReason.store(static_cast<int>(fallbackReason), std::memory_order_relaxed);
+    _lastBatchKernelChannels.store(numChannels, std::memory_order_relaxed);
+  }
 };
 
 /// \brief Configuration for an LSTM model

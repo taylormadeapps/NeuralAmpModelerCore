@@ -23,19 +23,19 @@ public:
   {
     static const std::regex semver_regex(R"(^\d+\.\d+\.\d+$)");
     if (!std::regex_match(version, semver_regex))
-      return Supported::NO;
+      return Supported::UNSUPPORTED;
 
     const Version parsed = ParseVersion(version);
     const Version latest = ParseVersion(LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION);
     const Version earliest = ParseVersion(EARLIEST_SUPPORTED_NAM_FILE_VERSION);
 
     if (parsed < earliest)
-      return Supported::NO;
+      return Supported::UNSUPPORTED;
     if (parsed.major > latest.major || parsed.minor > latest.minor)
-      return Supported::NO;
+      return Supported::UNSUPPORTED;
     if (latest < parsed)
       return Supported::PARTIAL;
-    return Supported::YES;
+    return Supported::FULL;
   }
 };
 
@@ -101,7 +101,7 @@ void register_version_support_checker(std::shared_ptr<const IVersionSupportCheck
 Supported is_version_supported(const std::string version)
 {
   std::lock_guard<std::mutex> lock(version_support_registry_mutex());
-  Supported best_support = Supported::NO;
+  Supported best_support = Supported::UNSUPPORTED;
   for (const auto& checker : version_support_registry())
   {
     const auto candidate_support = checker->support(version);
@@ -114,7 +114,7 @@ Supported is_version_supported(const std::string version)
 void verify_config_version(const std::string versionStr)
 {
   const Supported support = is_version_supported(versionStr);
-  if (support == Supported::NO)
+  if (support == Supported::UNSUPPORTED)
   {
     std::stringstream ss;
     ss << "Model config is an unsupported version " << versionStr << ".";

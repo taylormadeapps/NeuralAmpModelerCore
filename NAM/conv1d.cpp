@@ -2,6 +2,9 @@
 #include "compiler.h"
 #include <cstring>
 #include <stdexcept>
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
 
 namespace nam
 {
@@ -142,11 +145,31 @@ void Conv1D::SetMaxBufferSize(const int maxBufferSize)
   _output.setZero();
 }
 
+RingBuffer Conv1D::createFreshRingBuffer() const
+{
+  RingBuffer rb;
+  const long kernel_size = get_kernel_size();
+  const long dilation = get_dilation();
+  const long receptive_field = kernel_size > 0 ? (kernel_size - 1) * dilation : 0;
+  rb.SetMaxLookback(receptive_field);
+  rb.Reset(get_in_channels(), _max_buffer_size);
+  return rb;
+}
 
 void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
 {
+  ProcessWithRingBuffer(input, _input_buffer, num_frames);
+}
+
+void Conv1D::ProcessExternal(const Eigen::MatrixXf& input, RingBuffer& ring_buffer, const int num_frames)
+{
+  ProcessWithRingBuffer(input, ring_buffer, num_frames);
+}
+
+void Conv1D::ProcessWithRingBuffer(const Eigen::MatrixXf& input, RingBuffer& ring_buffer, const int num_frames)
+{
   // Write input to ring buffer
-  _input_buffer.Write(input, num_frames);
+  ring_buffer.Write(input, num_frames);
 
   // Note: setZero is deferred - only called for paths that need it (those using +=)
   // Fused kernel paths use direct assignment (=) and skip setZero
@@ -245,7 +268,7 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
     {
       const long offset = this->_dilation * (k + 1 - (long)kernel_size);
       const long lookback = -offset;
-      auto input_block = _input_buffer.Read(num_frames, lookback);
+      auto input_block = ring_buffer.Read(num_frames, lookback);
       // Element-wise multiply: each row of input_block is multiplied by corresponding weight
       _output.leftCols(num_frames).noalias() +=
         this->_depthwise_weight[k].asDiagonal() * input_block.leftCols(num_frames);
@@ -272,9 +295,9 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
     {
       // Fused 4x4 kernel_size=3: read all 3 input blocks and compute in one pass
       const long dil = this->_dilation;
-      auto in0 = _input_buffer.Read(num_frames, 2 * dil); // oldest (k=0)
-      auto in1 = _input_buffer.Read(num_frames, dil); // middle (k=1)
-      auto in2 = _input_buffer.Read(num_frames, 0); // newest (k=2)
+      auto in0 = ring_buffer.Read(num_frames, 2 * dil); // oldest (k=0)
+      auto in1 = ring_buffer.Read(num_frames, dil); // middle (k=1)
+      auto in2 = ring_buffer.Read(num_frames, 0); // newest (k=2)
 
       const float* NAM_RESTRICT in0_ptr = in0.data();
       const float* NAM_RESTRICT in1_ptr = in1.data();
@@ -329,9 +352,9 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
     {
       // Fused 2x2 kernel_size=3: read all 3 input blocks and compute in one pass
       const long dil = this->_dilation;
-      auto in0 = _input_buffer.Read(num_frames, 2 * dil);
-      auto in1 = _input_buffer.Read(num_frames, dil);
-      auto in2 = _input_buffer.Read(num_frames, 0);
+      auto in0 = ring_buffer.Read(num_frames, 2 * dil);
+      auto in1 = ring_buffer.Read(num_frames, dil);
+      auto in2 = ring_buffer.Read(num_frames, 0);
 
       const float* NAM_RESTRICT in0_ptr = in0.data();
       const float* NAM_RESTRICT in1_ptr = in1.data();
@@ -363,12 +386,12 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
     {
       // Fused 3x3 kernel_size=6: read all 6 input blocks and compute in one pass
       const long dil = this->_dilation;
-      auto in0 = _input_buffer.Read(num_frames, 5 * dil);
-      auto in1 = _input_buffer.Read(num_frames, 4 * dil);
-      auto in2 = _input_buffer.Read(num_frames, 3 * dil);
-      auto in3 = _input_buffer.Read(num_frames, 2 * dil);
-      auto in4 = _input_buffer.Read(num_frames, dil);
-      auto in5 = _input_buffer.Read(num_frames, 0);
+      auto in0 = ring_buffer.Read(num_frames, 5 * dil);
+      auto in1 = ring_buffer.Read(num_frames, 4 * dil);
+      auto in2 = ring_buffer.Read(num_frames, 3 * dil);
+      auto in3 = ring_buffer.Read(num_frames, 2 * dil);
+      auto in4 = ring_buffer.Read(num_frames, dil);
+      auto in5 = ring_buffer.Read(num_frames, 0);
 
       const float* NAM_RESTRICT in_ptrs[6] = {in0.data(), in1.data(), in2.data(), in3.data(), in4.data(), in5.data()};
       float* NAM_RESTRICT output_ptr = _output.data();
@@ -412,7 +435,7 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
       {
         const long offset = this->_dilation * (k + 1 - (long)kernel_size);
         const long lookback = -offset;
-        auto input_block = _input_buffer.Read(num_frames, lookback);
+        auto input_block = ring_buffer.Read(num_frames, lookback);
 
         const float* NAM_RESTRICT input_ptr = input_block.data();
         const float* NAM_RESTRICT weight_ptr = this->_weight[k].data();
@@ -660,7 +683,7 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
     {
       const long offset = this->_dilation * (k + 1 - (long)this->_weight.size());
       const long lookback = -offset;
-      auto input_block = _input_buffer.Read(num_frames, lookback);
+      auto input_block = ring_buffer.Read(num_frames, lookback);
       _output.leftCols(num_frames).noalias() += this->_weight[k] * input_block;
     }
 #endif
@@ -754,7 +777,64 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
   }
 
   // Advance ring buffer write pointer after processing
-  _input_buffer.Advance(num_frames);
+  ring_buffer.Advance(num_frames);
+}
+
+void Conv1D::ProcessBatchExternal(const Eigen::MatrixXf& packed_input, RingBuffer* const* ring_buffers,
+                                  const int num_frames, const int num_channels,
+                                  Eigen::MatrixXf& output, Eigen::MatrixXf& input_scratch) const
+{
+  assert(supportsDenseBatch() && "ProcessBatchExternal requires a dense non-depthwise Conv1D");
+  assert(num_frames > 0 && num_channels > 0);
+
+  const int packed_cols = num_frames * num_channels;
+  const long in_channels = get_in_channels();
+  const long out_channels = get_out_channels();
+
+  assert(packed_input.rows() == in_channels);
+  assert(packed_input.cols() >= packed_cols);
+  assert(output.rows() == out_channels);
+  assert(output.cols() >= packed_cols);
+  assert(input_scratch.rows() == in_channels);
+  assert(input_scratch.cols() >= packed_cols);
+
+  for (int ch = 0; ch < num_channels; ++ch)
+  {
+    assert(ring_buffers[ch] != nullptr);
+    ring_buffers[ch]->WriteColumns(packed_input, ch * num_frames, num_frames);
+  }
+
+  output.leftCols(packed_cols).setZero();
+
+  for (size_t k = 0; k < this->_weight.size(); ++k)
+  {
+    const long offset = this->_dilation * (k + 1 - (long)this->_weight.size());
+    const long lookback = -offset;
+
+    for (int ch = 0; ch < num_channels; ++ch)
+    {
+      auto input_block = ring_buffers[ch]->Read(num_frames, lookback);
+      input_scratch.middleCols(ch * num_frames, num_frames).noalias() = input_block.leftCols(num_frames);
+    }
+
+#if defined(__APPLE__)
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                (int)out_channels, packed_cols, (int)in_channels,
+                1.0f,
+                this->_weight[k].data(), (int)out_channels,
+                input_scratch.data(), (int)in_channels,
+                1.0f,
+                output.data(), (int)out_channels);
+#else
+    output.leftCols(packed_cols).noalias() += this->_weight[k] * input_scratch.leftCols(packed_cols);
+#endif
+  }
+
+  if (this->_bias.size() > 0)
+    output.leftCols(packed_cols).colwise() += this->_bias;
+
+  for (int ch = 0; ch < num_channels; ++ch)
+    ring_buffers[ch]->Advance(num_frames);
 }
 
 void Conv1D::process_(const Eigen::MatrixXf& input, Eigen::MatrixXf& output, const long i_start, const long ncols,

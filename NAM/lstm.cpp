@@ -1,10 +1,53 @@
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <memory>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include "registry.h"
 #include "lstm.h"
+
+namespace
+{
+void applyPackedTanh(float* data, long size)
+{
+  if (nam::activations::Activation::using_fast_tanh)
+  {
+    nam::activations::ActivationFastTanh tanhActivation;
+    tanhActivation.apply(data, size);
+    return;
+  }
+
+  nam::activations::ActivationTanh tanhActivation;
+  tanhActivation.apply(data, size);
+}
+
+void applyPackedSigmoid(float* data, long size)
+{
+  if (nam::activations::Activation::using_fast_tanh)
+  {
+#if defined(__APPLE__)
+    const float half = 0.5f;
+    const float halfOffset = 0.5f;
+    vDSP_vsmul(data, 1, &half, data, 1, (vDSP_Length)size);
+    applyPackedTanh(data, size);
+    vDSP_vsmul(data, 1, &half, data, 1, (vDSP_Length)size);
+    vDSP_vsadd(data, 1, &halfOffset, data, 1, (vDSP_Length)size);
+#else
+    for (long pos = 0; pos < size; ++pos)
+      data[pos] = nam::activations::fast_sigmoid(data[pos]);
+#endif
+    return;
+  }
+
+  nam::activations::ActivationSigmoid sigmoidActivation;
+  sigmoidActivation.apply(data, size);
+}
+}
 
 nam::lstm::LSTMCell::LSTMCell(const int input_size, const int hidden_size, std::vector<float>::iterator& weights)
 {
@@ -26,16 +69,35 @@ nam::lstm::LSTMCell::LSTMCell(const int input_size, const int hidden_size, std::
     this->_xh[i + h_offset] = *(weights++);
   for (int i = 0; i < hidden_size; i++)
     this->_c[i] = *(weights++);
+
+  // Save initial state templates for multi-channel cloning.
+  // Zero the input portion (only hidden portion was loaded from weights).
+  for (int i = 0; i < input_size; i++)
+    this->_xh[i] = 0.0f;
+  this->_initial_xh = this->_xh;
+  this->_initial_c = this->_c;
 }
 
-void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x)
+void nam::lstm::LSTMCell::process_(const Eigen::Ref<const Eigen::VectorXf>& x)
 {
   const long hidden_size = this->_get_hidden_size();
   const long input_size = this->_get_input_size();
   // Assign inputs
   this->_xh(Eigen::seq(0, input_size - 1)) = x;
   // The matmul
-  this->_ifgo = this->_w * this->_xh + this->_b;
+#if defined(__APPLE__)
+  this->_ifgo = this->_b;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_w.rows(), (int)this->_w.cols(),
+              1.0f,
+              this->_w.data(), (int)this->_w.rows(),
+              this->_xh.data(), 1,
+              1.0f,
+              this->_ifgo.data(), 1);
+#else
+  this->_ifgo.noalias() = this->_w * this->_xh;
+  this->_ifgo += this->_b;
+#endif
   // Elementwise updates (apply nonlinearities here)
   const long i_offset = 0;
   const long f_offset = hidden_size;
@@ -62,6 +124,134 @@ void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x)
 
     for (int i = 0; i < hidden_size; i++)
       this->_xh[i + h_offset] = activations::sigmoid(this->_ifgo[i + o_offset]) * tanhf(this->_c[i]);
+  }
+}
+
+// --- LSTMCell shared-weight multi-channel API --------------------------------
+
+nam::lstm::LSTMCellState nam::lstm::LSTMCell::createState() const
+{
+  LSTMCellState state;
+  state._xh = this->_initial_xh;
+  state._ifgo.resize(this->_ifgo.size());
+  state._c = this->_initial_c;
+  return state;
+}
+
+void nam::lstm::LSTMCell::process_(const Eigen::VectorXf& x, LSTMCellState& state) const
+{
+  const long hidden_size = this->_get_hidden_size();
+  const long input_size = this->_get_input_size();
+  // Assign inputs
+  state._xh(Eigen::seq(0, input_size - 1)) = x;
+  // The matmul — shared weights, external state
+#if defined(__APPLE__)
+  state._ifgo = this->_b;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_w.rows(), (int)this->_w.cols(),
+              1.0f,
+              this->_w.data(), (int)this->_w.rows(),
+              state._xh.data(), 1,
+              1.0f,
+              state._ifgo.data(), 1);
+#else
+  state._ifgo = this->_w * state._xh + this->_b;
+#endif
+  // Elementwise updates (apply nonlinearities)
+  const long i_offset = 0;
+  const long f_offset = hidden_size;
+  const long g_offset = 2 * hidden_size;
+  const long o_offset = 3 * hidden_size;
+  const long h_offset = input_size;
+
+  if (activations::Activation::using_fast_tanh)
+  {
+    for (auto i = 0; i < hidden_size; i++)
+      state._c[i] =
+        activations::fast_sigmoid(state._ifgo[i + f_offset]) * state._c[i]
+        + activations::fast_sigmoid(state._ifgo[i + i_offset]) * activations::fast_tanh(state._ifgo[i + g_offset]);
+
+    for (int i = 0; i < hidden_size; i++)
+      state._xh[i + h_offset] =
+        activations::fast_sigmoid(state._ifgo[i + o_offset]) * activations::fast_tanh(state._c[i]);
+  }
+  else
+  {
+    for (auto i = 0; i < hidden_size; i++)
+      state._c[i] = activations::sigmoid(state._ifgo[i + f_offset]) * state._c[i]
+                    + activations::sigmoid(state._ifgo[i + i_offset]) * tanhf(state._ifgo[i + g_offset]);
+
+    for (int i = 0; i < hidden_size; i++)
+      state._xh[i + h_offset] = activations::sigmoid(state._ifgo[i + o_offset]) * tanhf(state._c[i]);
+  }
+}
+
+// --- LSTMCell batched processing (N channels, one GEMM) ---------------------
+
+void nam::lstm::LSTMCell::processBatch_(Eigen::MatrixXf& batch_xh, Eigen::MatrixXf& batch_ifgo,
+                                         LSTMCellState** states, int N) const
+{
+  const long hs = this->_get_hidden_size();
+  const long is = this->_get_input_size();
+
+  // 1. Stack N _xh vectors as columns into batch_xh.
+  for (int ch = 0; ch < N; ++ch)
+    batch_xh.col(ch) = states[ch]->_xh;
+
+  // 2. Batched GEMM: batch_ifgo = _w * batch_xh + _b (broadcast).
+  //    Pre-fill with bias, then GEMM adds the product.
+  batch_ifgo.leftCols(N).colwise() = this->_b;
+
+#if defined(__APPLE__)
+  cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+              (int)this->_w.rows(), N, (int)this->_w.cols(),
+              1.0f,
+              this->_w.data(), (int)this->_w.rows(),
+              batch_xh.data(), (int)batch_xh.rows(),
+              1.0f,  // beta=1.0: adds to pre-filled bias
+              batch_ifgo.data(), (int)batch_ifgo.rows());
+#else
+  batch_ifgo.leftCols(N).noalias() += this->_w * batch_xh.leftCols(N);
+#endif
+
+  // 3. Per-channel gate updates (elementwise — _c is channel-specific).
+  const long i_offset = 0;
+  const long f_offset = hs;
+  const long g_offset = 2 * hs;
+  const long o_offset = 3 * hs;
+  const long h_offset = is;
+
+  if (activations::Activation::using_fast_tanh)
+  {
+    for (int ch = 0; ch < N; ++ch)
+    {
+      auto& st = *states[ch];
+      const float* ifgo = batch_ifgo.col(ch).data();
+
+      for (long i = 0; i < hs; i++)
+        st._c[i] =
+          activations::fast_sigmoid(ifgo[f_offset + i]) * st._c[i]
+          + activations::fast_sigmoid(ifgo[i_offset + i]) * activations::fast_tanh(ifgo[g_offset + i]);
+
+      for (long i = 0; i < hs; i++)
+        st._xh[h_offset + i] =
+          activations::fast_sigmoid(ifgo[o_offset + i]) * activations::fast_tanh(st._c[i]);
+    }
+  }
+  else
+  {
+    for (int ch = 0; ch < N; ++ch)
+    {
+      auto& st = *states[ch];
+      const float* ifgo = batch_ifgo.col(ch).data();
+
+      for (long i = 0; i < hs; i++)
+        st._c[i] = activations::sigmoid(ifgo[f_offset + i]) * st._c[i]
+                    + activations::sigmoid(ifgo[i_offset + i]) * tanhf(ifgo[g_offset + i]);
+
+      for (long i = 0; i < hs; i++)
+        st._xh[h_offset + i] = activations::sigmoid(ifgo[o_offset + i]) * tanhf(st._c[i]);
+    }
   }
 }
 
@@ -158,10 +348,464 @@ void nam::lstm::LSTM::_process_sample()
 
   // Compute matrix-vector product: (out_channels x hidden_size) * (hidden_size) = (out_channels)
   // Store directly in _output (which is already sized correctly in constructor)
+#if defined(__APPLE__)
+  this->_output = this->_head_bias;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_head_weight.rows(), (int)this->_head_weight.cols(),
+              1.0f,
+              this->_head_weight.data(), (int)this->_head_weight.rows(),
+              hidden_state.data(), 1,
+              1.0f,
+              this->_output.data(), 1);
+#else
   this->_output.noalias() = this->_head_weight * hidden_state;
-
-  // Add bias: (out_channels) += (out_channels)
   this->_output.noalias() += this->_head_bias;
+#endif
+}
+
+// --- LSTM shared-weight multi-channel API ------------------------------------
+
+nam::lstm::LSTMChannelState nam::lstm::LSTM::createTypedChannelState() const
+{
+  LSTMChannelState state;
+  state.layers.reserve(this->_layers.size());
+  for (const auto& layer : this->_layers)
+    state.layers.push_back(layer.createState());
+  state._input.resize(this->_input.size());
+  state._input.setZero();
+  state._output.resize(this->_output.size());
+  state._output.setZero();
+  return state;
+}
+
+void nam::lstm::LSTM::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                              LSTMChannelState& state) const
+{
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+
+  for (int i = 0; i < num_frames; i++)
+  {
+    for (int ch = 0; ch < in_channels; ch++)
+      state._input(ch) = input[ch][i];
+
+    this->_process_sample(state);
+
+    for (int ch = 0; ch < out_channels; ch++)
+      output[ch][i] = state._output(ch);
+  }
+}
+
+void nam::lstm::LSTM::_process_sample(LSTMChannelState& state) const
+{
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+
+  if (this->_layers.size() == 0)
+  {
+    const int channels_to_copy = std::min(in_channels, out_channels);
+    for (int ch = 0; ch < channels_to_copy; ch++)
+      state._output(ch) = state._input(ch);
+    for (int ch = channels_to_copy; ch < out_channels; ch++)
+      state._output(ch) = 0.0f;
+    return;
+  }
+
+  this->_layers[0].process_(state._input, state.layers[0]);
+  for (size_t i = 1; i < this->_layers.size(); i++)
+    this->_layers[i].process_(
+      this->_layers[i - 1].get_hidden_state(state.layers[i - 1]),
+      state.layers[i]);
+
+  const Eigen::VectorXf& hidden_state =
+    this->_layers[this->_layers.size() - 1].get_hidden_state(
+      state.layers[this->_layers.size() - 1]);
+
+#if defined(__APPLE__)
+  state._output = this->_head_bias;
+  cblas_sgemv(CblasColMajor, CblasNoTrans,
+              (int)this->_head_weight.rows(), (int)this->_head_weight.cols(),
+              1.0f,
+              this->_head_weight.data(), (int)this->_head_weight.rows(),
+              hidden_state.data(), 1,
+              1.0f,
+              state._output.data(), 1);
+#else
+  state._output.noalias() = this->_head_weight * hidden_state;
+  state._output.noalias() += this->_head_bias;
+#endif
+}
+
+void nam::lstm::LSTM::prewarmTypedChannelState(LSTMChannelState& state) const
+{
+  const int prewarmSamples = (int)(0.5 * mExpectedSampleRate);
+  const int samples = prewarmSamples <= 0 ? 1 : prewarmSamples;
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+
+  // Allocate temporary silence buffers on the message thread
+  std::vector<std::vector<NAM_SAMPLE>> inputBuffers(in_channels);
+  std::vector<std::vector<NAM_SAMPLE>> outputBuffers(out_channels);
+  std::vector<NAM_SAMPLE*> inputPtrs(in_channels);
+  std::vector<NAM_SAMPLE*> outputPtrs(out_channels);
+
+  for (int ch = 0; ch < in_channels; ch++)
+  {
+    inputBuffers[ch].resize(samples, 0.0);
+    inputPtrs[ch] = inputBuffers[ch].data();
+  }
+  for (int ch = 0; ch < out_channels; ch++)
+  {
+    outputBuffers[ch].resize(samples, 0.0);
+    outputPtrs[ch] = outputBuffers[ch].data();
+  }
+
+  this->process(inputPtrs.data(), outputPtrs.data(), samples, state);
+}
+
+// --- DSP virtual interface overrides -----------------------------------------
+
+std::unique_ptr<nam::ChannelState> nam::lstm::LSTM::createChannelState() const
+{
+  return std::make_unique<LSTMChannelState>(createTypedChannelState());
+}
+
+void nam::lstm::LSTM::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                     ChannelState& state)
+{
+  auto& lstmState = static_cast<LSTMChannelState&>(state);
+  process(input, output, num_frames, lstmState);
+}
+
+void nam::lstm::LSTM::prewarmChannelState(ChannelState& state)
+{
+  auto& lstmState = static_cast<LSTMChannelState&>(state);
+  prewarmTypedChannelState(lstmState);
+}
+
+// --- Batched multi-channel processing ----------------------------------------
+
+void nam::lstm::LSTM::prepareBatch(int maxBatchSize)
+{
+  if (maxBatchSize <= 0)
+    return;
+  _max_batch_size = maxBatchSize;
+
+  // Allocate per-layer batch scratch matrices.
+  _batch_layer_scratch.resize(this->_layers.size());
+  for (size_t l = 0; l < this->_layers.size(); l++)
+  {
+    // _w is (4*dh × (dx+dh)) — use friend access to get dimensions.
+    const int xh_rows = (int)this->_layers[l]._w.cols();   // dx + dh
+    const int ifgo_rows = (int)this->_layers[l]._w.rows();  // 4 * dh
+    const int hidden_rows = ifgo_rows / 4;
+
+    _batch_layer_scratch[l].xh.resize(xh_rows, maxBatchSize);
+    _batch_layer_scratch[l].ifgo.resize(ifgo_rows, maxBatchSize);
+    _batch_layer_scratch[l].i.resize(hidden_rows, maxBatchSize);
+    _batch_layer_scratch[l].f.resize(hidden_rows, maxBatchSize);
+    _batch_layer_scratch[l].g.resize(hidden_rows, maxBatchSize);
+    _batch_layer_scratch[l].o.resize(hidden_rows, maxBatchSize);
+    _batch_layer_scratch[l].c.resize(hidden_rows, maxBatchSize);
+    _batch_layer_scratch[l].h.resize(hidden_rows, maxBatchSize);
+  }
+
+  // Head projection scratch: hidden_size from last layer.
+  if (!this->_layers.empty())
+  {
+    const int hidden_size = (int)this->_layers.back()._get_hidden_size();
+    _batch_hidden.resize(hidden_size, maxBatchSize);
+  }
+  _batch_output.resize(this->_head_weight.rows(), maxBatchSize);
+  _batch_channel_state_ptrs.resize(maxBatchSize);
+  _batch_cell_state_ptrs.resize(maxBatchSize);
+}
+
+void nam::lstm::LSTM::processSmallBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                                                int numFrames, LSTMChannelState** states, int numChannels)
+{
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+  const int numLayers = (int)this->_layers.size();
+
+  if (in_channels == 1 && out_channels == 1)
+  {
+    // Fast path continues below; the scalar copy loop is handled with a narrower
+    // store once the packed gate math has produced the output matrix.
+  }
+
+  if (numLayers == 0)
+  {
+    for (int f = 0; f < numFrames; ++f)
+    {
+      for (int ch = 0; ch < numChannels; ++ch)
+      {
+        const float sample = monoInputs[ch][f];
+        for (int c = 0; c < out_channels; ++c)
+          monoOutputs[ch][f] = c < in_channels ? sample : 0.0f;
+      }
+    }
+    return;
+  }
+
+  for (int f = 0; f < numFrames; ++f)
+  {
+    for (int ch = 0; ch < numChannels; ++ch)
+    {
+      auto& state = *states[ch];
+      for (int c = 0; c < in_channels; ++c)
+        state._input(c) = monoInputs[ch][f];
+    }
+
+    for (int l = 0; l < numLayers; ++l)
+    {
+      const auto& layer = this->_layers[(size_t)l];
+      auto& scratch = _batch_layer_scratch[(size_t)l];
+      const int hidden_size = (int) layer._get_hidden_size();
+      const int input_size = (int) layer._get_input_size();
+
+      for (int ch = 0; ch < numChannels; ++ch)
+      {
+        auto& cellState = states[ch]->layers[(size_t)l];
+        auto* xhDest = scratch.xh.col(ch).data();
+
+        if (l == 0)
+          std::memcpy(xhDest, states[ch]->_input.data(), sizeof(float) * (size_t) input_size);
+        else
+          std::memcpy(xhDest, _batch_layer_scratch[(size_t)(l - 1)].h.col(ch).data(),
+                      sizeof(float) * (size_t) input_size);
+
+        std::memcpy(xhDest + input_size,
+                    cellState._xh.data() + input_size,
+                    sizeof(float) * (size_t) hidden_size);
+        std::memcpy(scratch.c.col(ch).data(), cellState._c.data(), sizeof(float) * (size_t) hidden_size);
+
+        std::memcpy(scratch.ifgo.col(ch).data(), layer._b.data(), sizeof(float) * (size_t) (4 * hidden_size));
+#if defined(__APPLE__)
+        cblas_sgemv(CblasColMajor, CblasNoTrans,
+                    (int) layer._w.rows(), (int) layer._w.cols(),
+                    1.0f,
+                    layer._w.data(), (int) layer._w.rows(),
+                    scratch.xh.col(ch).data(), 1,
+                    1.0f,
+                    scratch.ifgo.col(ch).data(), 1);
+#else
+        scratch.ifgo.col(ch).noalias() += layer._w * scratch.xh.col(ch);
+#endif
+
+        std::memcpy(scratch.i.col(ch).data(), scratch.ifgo.col(ch).data(), sizeof(float) * (size_t) hidden_size);
+        std::memcpy(scratch.f.col(ch).data(),
+                    scratch.ifgo.col(ch).data() + hidden_size,
+                    sizeof(float) * (size_t) hidden_size);
+        std::memcpy(scratch.g.col(ch).data(),
+                    scratch.ifgo.col(ch).data() + 2 * hidden_size,
+                    sizeof(float) * (size_t) hidden_size);
+        std::memcpy(scratch.o.col(ch).data(),
+                    scratch.ifgo.col(ch).data() + 3 * hidden_size,
+                    sizeof(float) * (size_t) hidden_size);
+      }
+
+      const long packedCount = (long) hidden_size * (long) numChannels;
+      applyPackedSigmoid(scratch.i.data(), packedCount);
+      applyPackedSigmoid(scratch.f.data(), packedCount);
+      applyPackedTanh(scratch.g.data(), packedCount);
+      applyPackedSigmoid(scratch.o.data(), packedCount);
+
+#if defined(__APPLE__)
+      vDSP_vmul(scratch.f.data(), 1, scratch.c.data(), 1, scratch.c.data(), 1, (vDSP_Length) packedCount);
+      vDSP_vmul(scratch.i.data(), 1, scratch.g.data(), 1, scratch.h.data(), 1, (vDSP_Length) packedCount);
+      vDSP_vadd(scratch.c.data(), 1, scratch.h.data(), 1, scratch.c.data(), 1, (vDSP_Length) packedCount);
+#else
+      for (long pos = 0; pos < packedCount; ++pos)
+        scratch.c.data()[pos] = scratch.f.data()[pos] * scratch.c.data()[pos]
+                                + scratch.i.data()[pos] * scratch.g.data()[pos];
+#endif
+
+      std::memcpy(scratch.h.data(), scratch.c.data(), sizeof(float) * (size_t) packedCount);
+      applyPackedTanh(scratch.h.data(), packedCount);
+#if defined(__APPLE__)
+      vDSP_vmul(scratch.o.data(), 1, scratch.h.data(), 1, scratch.h.data(), 1, (vDSP_Length) packedCount);
+#else
+      for (long pos = 0; pos < packedCount; ++pos)
+        scratch.h.data()[pos] = scratch.o.data()[pos] * scratch.h.data()[pos];
+#endif
+
+      for (int ch = 0; ch < numChannels; ++ch)
+      {
+        auto& cellState = states[ch]->layers[(size_t)l];
+        std::memcpy(cellState._c.data(), scratch.c.col(ch).data(), sizeof(float) * (size_t) hidden_size);
+        std::memcpy(cellState._xh.data() + input_size,
+                    scratch.h.col(ch).data(),
+                    sizeof(float) * (size_t) hidden_size);
+      }
+    }
+
+    for (int ch = 0; ch < numChannels; ++ch)
+    {
+      const float* hidden = _batch_layer_scratch[(size_t)(numLayers - 1)].h.col(ch).data();
+      auto* output = _batch_output.col(ch).data();
+
+      std::memcpy(output, this->_head_bias.data(), sizeof(float) * (size_t) out_channels);
+#if defined(__APPLE__)
+      cblas_sgemv(CblasColMajor, CblasNoTrans,
+                  (int) this->_head_weight.rows(), (int) this->_head_weight.cols(),
+                  1.0f,
+                  this->_head_weight.data(), (int) this->_head_weight.rows(),
+                  hidden, 1,
+                  1.0f,
+                  output, 1);
+#else
+      _batch_output.col(ch).noalias() += this->_head_weight * _batch_layer_scratch[(size_t)(numLayers - 1)].h.col(ch);
+#endif
+
+      states[ch]->_output = _batch_output.col(ch);
+      for (int c = 0; c < out_channels; ++c)
+        monoOutputs[ch][f] = states[ch]->_output(c);
+    }
+  }
+}
+
+void nam::lstm::LSTM::processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                                            int numFrames, ChannelState** states, int numChannels)
+{
+  const int N = numChannels;
+  if (N <= 0)
+    return;
+
+  setLastBatchKernelDebugInfo(BatchKernelMode::inactive,
+                              BatchKernelFallbackReason::none,
+                              N);
+  const int in_channels = NumInputChannels();
+  const int out_channels = NumOutputChannels();
+  const int numLayers = (int)this->_layers.size();
+
+  if (_max_batch_size < N || (int)_batch_channel_state_ptrs.size() < N)
+  {
+    setLastBatchKernelDebugInfo(BatchKernelMode::directSequential,
+                                BatchKernelFallbackReason::batchScratchTooSmall,
+                                N);
+
+    NAM_SAMPLE* inputPtrs[1];
+    NAM_SAMPLE* outputPtrs[1];
+    for (int ch = 0; ch < N; ++ch)
+    {
+      if (states[ch] == nullptr)
+        continue;
+
+      inputPtrs[0] = monoInputs[ch];
+      outputPtrs[0] = monoOutputs[ch];
+      processChannel(inputPtrs, outputPtrs, numFrames, *states[ch]);
+    }
+    return;
+  }
+
+  LSTMChannelState** sp = _batch_channel_state_ptrs.data();
+  for (int ch = 0; ch < N; ++ch)
+    sp[ch] = static_cast<LSTMChannelState*>(states[ch]);
+
+  // Small LSTM groups stay on the shared-weight SGEMV path. The wide SGEMM
+  // kernel only becomes worthwhile once the batch is wide enough to amortise
+  // packing and scatter overhead on this model family.
+  if (N < kTurboBatchMinChannels)
+  {
+    setLastBatchKernelDebugInfo(BatchKernelMode::packedSmallBatch,
+                                BatchKernelFallbackReason::belowTurboThreshold,
+                                N);
+    processSmallBatchChannels(monoInputs, monoOutputs, numFrames, sp, N);
+    return;
+  }
+
+  setLastBatchKernelDebugInfo(BatchKernelMode::turboBatch,
+                              BatchKernelFallbackReason::none,
+                              N);
+
+  // Per-layer cell state pointers (reused each sample).
+  LSTMCellState** cp = _batch_cell_state_ptrs.data();
+
+  // Process frame by frame — LSTM is per-sample recurrent.
+  for (int f = 0; f < numFrames; ++f)
+  {
+    // 1. Set each channel's input from the mono buffers.
+    for (int ch = 0; ch < N; ++ch)
+    {
+      for (int c = 0; c < in_channels; ++c)
+        sp[ch]->_input(c) = monoInputs[ch][f];
+    }
+
+    if (numLayers == 0)
+    {
+      // No layers — pass input to output.
+      for (int ch = 0; ch < N; ++ch)
+      {
+        const int toCopy = std::min(in_channels, out_channels);
+        for (int c = 0; c < toCopy; ++c)
+          sp[ch]->_output(c) = sp[ch]->_input(c);
+        for (int c = toCopy; c < out_channels; ++c)
+          sp[ch]->_output(c) = 0.0f;
+      }
+    }
+    else
+    {
+      // --- Layer 0: input is the model input ---
+      for (int ch = 0; ch < N; ++ch)
+      {
+        auto& ls = sp[ch]->layers[0];
+        // Write input into _xh (first `input_size` elements).
+        ls._xh.head(sp[ch]->_input.size()) = sp[ch]->_input;
+        cp[ch] = &ls;
+      }
+      this->_layers[0].processBatch_(
+          _batch_layer_scratch[0].xh, _batch_layer_scratch[0].ifgo, cp, N);
+
+      // --- Subsequent layers: input is previous layer's hidden state ---
+      for (int l = 1; l < numLayers; ++l)
+      {
+        for (int ch = 0; ch < N; ++ch)
+        {
+          // Get hidden state from previous layer.
+          const Eigen::VectorXf h = this->_layers[l - 1].get_hidden_state(sp[ch]->layers[l - 1]);
+          // Write into this layer's _xh.
+          sp[ch]->layers[l]._xh.head(h.size()) = h;
+          cp[ch] = &sp[ch]->layers[l];
+        }
+        this->_layers[l].processBatch_(
+            _batch_layer_scratch[l].xh, _batch_layer_scratch[l].ifgo, cp, N);
+      }
+
+      // --- Head projection: batched across all N channels ---
+      // Stack hidden states from last layer.
+      for (int ch = 0; ch < N; ++ch)
+      {
+        _batch_hidden.col(ch) =
+            this->_layers[numLayers - 1].get_hidden_state(sp[ch]->layers[numLayers - 1]);
+      }
+
+      // batch_output = _head_weight * batch_hidden + _head_bias (broadcast)
+      _batch_output.leftCols(N).colwise() = this->_head_bias;
+#if defined(__APPLE__)
+      cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                  (int)this->_head_weight.rows(), N, (int)this->_head_weight.cols(),
+                  1.0f,
+                  this->_head_weight.data(), (int)this->_head_weight.rows(),
+                  _batch_hidden.data(), (int)_batch_hidden.rows(),
+                  1.0f,
+                  _batch_output.data(), (int)_batch_output.rows());
+#else
+      _batch_output.leftCols(N).noalias() += this->_head_weight * _batch_hidden.leftCols(N);
+#endif
+
+      // Scatter outputs back to per-channel state.
+      for (int ch = 0; ch < N; ++ch)
+        sp[ch]->_output = _batch_output.col(ch);
+    }
+
+    // 2. Copy per-channel output to the mono output buffers.
+    for (int ch = 0; ch < N; ++ch)
+    {
+      for (int c = 0; c < out_channels; ++c)
+        monoOutputs[ch][f] = sp[ch]->_output(c);
+    }
+  }
 }
 
 // Config parser
@@ -180,8 +824,8 @@ nam::lstm::LSTMConfig nam::lstm::parse_config_json(const nlohmann::json& config)
 // LSTMConfig::create()
 std::unique_ptr<nam::DSP> nam::lstm::LSTMConfig::create(std::vector<float> weights, double sampleRate)
 {
-  return std::make_unique<nam::lstm::LSTM>(
-    in_channels, out_channels, num_layers, input_size, hidden_size, weights, sampleRate);
+  return std::make_unique<nam::lstm::LSTM>(in_channels, out_channels, num_layers, input_size, hidden_size, weights,
+                                           sampleRate);
 }
 
 // Config parser for ConfigParserRegistry

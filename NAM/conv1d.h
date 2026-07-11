@@ -82,6 +82,23 @@ public:
   /// \param num_frames Number of frames to process
   void Process(const Eigen::MatrixXf& input, const int num_frames);
 
+  /// \brief Process input using an external ring buffer and write to the internal output buffer
+  /// \param input Input matrix (channels x num_frames)
+  /// \param ring_buffer Per-channel ring buffer to use for streaming history
+  /// \param num_frames Number of frames to process
+  void ProcessExternal(const Eigen::MatrixXf& input, RingBuffer& ring_buffer, const int num_frames);
+
+  /// \brief Process packed channel lanes using external per-lane ring buffers
+  /// \param packed_input Input matrix laid out as channels x (num_frames * num_channels)
+  /// \param ring_buffers One ring buffer per packed lane
+  /// \param num_frames Number of frames per lane
+  /// \param num_channels Number of packed lanes
+  /// \param output Output matrix laid out as out_channels x (num_frames * num_channels)
+  /// \param input_scratch Scratch matrix sized in_channels x (num_frames * num_channels)
+  void ProcessBatchExternal(const Eigen::MatrixXf& packed_input, RingBuffer* const* ring_buffers,
+                            const int num_frames, const int num_channels,
+                            Eigen::MatrixXf& output, Eigen::MatrixXf& input_scratch) const;
+
   /// \brief Process from input to output (legacy method, kept for compatibility)
   ///
   /// Rightmost indices of input go from i_start for ncols,
@@ -117,6 +134,15 @@ public:
   /// \return true if bias is present, false otherwise
   bool has_bias() const { return this->_bias.size() > 0; };
 
+  /// \brief Whether this convolution can use the dense packed batch kernel.
+  bool supportsDenseBatch() const { return !this->_is_depthwise && this->_num_groups == 1; }
+
+  /// \brief Create a fresh ring buffer configured like this layer's internal buffer.
+  RingBuffer createFreshRingBuffer() const;
+
+  /// \brief Swap the internal ring buffer with an external one.
+  void swapRingBuffer(RingBuffer& other) { std::swap(_input_buffer, other); }
+
 protected:
   // conv[kernel](cout, cin) - used for non-depthwise convolutions
   std::vector<Eigen::MatrixXf> _weight;
@@ -130,6 +156,8 @@ protected:
   int _num_groups;
 
 private:
+  void ProcessWithRingBuffer(const Eigen::MatrixXf& input, RingBuffer& ring_buffer, const int num_frames);
+
   RingBuffer _input_buffer; // Ring buffer for input (channels x buffer_size)
   Eigen::MatrixXf _output; // Pre-allocated output buffer (out_channels x maxBufferSize)
   int _max_buffer_size = 0; // Stored maxBufferSize

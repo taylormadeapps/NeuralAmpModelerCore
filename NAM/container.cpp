@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <stdexcept>
 #include <sstream>
@@ -11,6 +12,31 @@ namespace nam
 {
 namespace container
 {
+
+namespace
+{
+
+class ScopedPrewarmOnReset
+{
+public:
+  ScopedPrewarmOnReset(DSP& dsp, const bool enabled)
+  : _dsp(dsp)
+  , _previous(dsp.GetPrewarmOnReset())
+  {
+    _dsp.SetPrewarmOnReset(enabled);
+  }
+
+  ~ScopedPrewarmOnReset() { _dsp.SetPrewarmOnReset(_previous); }
+
+  ScopedPrewarmOnReset(const ScopedPrewarmOnReset&) = delete;
+  ScopedPrewarmOnReset& operator=(const ScopedPrewarmOnReset&) = delete;
+
+private:
+  DSP& _dsp;
+  bool _previous;
+};
+
+} // namespace
 
 // =============================================================================
 // ContainerModel
@@ -55,6 +81,54 @@ void ContainerModel::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int 
   _submodels[active_index].model->process(input, output, num_frames);
 }
 
+DSP::RuntimeImplementation ContainerModel::GetRuntimeImplementation() const
+{
+  const size_t active_index = _active_index.load(std::memory_order_acquire);
+  return _model_at(active_index).GetRuntimeImplementation();
+}
+
+std::unique_ptr<ChannelState> ContainerModel::createChannelState() const
+{
+  const size_t active_index = _active_index.load(std::memory_order_acquire);
+  auto submodel_state = _model_at(active_index).createChannelState();
+  if (submodel_state == nullptr)
+    return nullptr;
+
+  auto state = std::make_unique<ContainerChannelState>();
+  state->submodel_index = active_index;
+  state->submodel_state = std::move(submodel_state);
+  return state;
+}
+
+void ContainerModel::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state)
+{
+  auto& container_state = static_cast<ContainerChannelState&>(state);
+  assert(container_state.submodel_index < _submodels.size());
+  assert(container_state.submodel_state != nullptr);
+  _model_at(container_state.submodel_index)
+    .processChannel(input, output, num_frames, *container_state.submodel_state);
+}
+
+void ContainerModel::prewarmChannelState(ChannelState& state)
+{
+  auto& container_state = static_cast<ContainerChannelState&>(state);
+  assert(container_state.submodel_index < _submodels.size());
+  assert(container_state.submodel_state != nullptr);
+  _model_at(container_state.submodel_index).prewarmChannelState(*container_state.submodel_state);
+}
+
+void ContainerModel::processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                                          int numFrames, ChannelState** states, int numChannels)
+{
+  DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+}
+
+void ContainerModel::prepareBatch(int maxBatchSize)
+{
+  for (auto& sm : _submodels)
+    sm.model->prepareBatch(maxBatchSize);
+}
+
 void ContainerModel::prewarm()
 {
   const size_t active_index = _active_index.load(std::memory_order_acquire);
@@ -79,7 +153,21 @@ void ContainerModel::Reset(const double sampleRate, const int maxBufferSize)
   SetMaxBufferSize(maxBufferSize);
 
   const size_t active_index = _active_index.load(std::memory_order_acquire);
-  _submodels[active_index].model->Reset(sampleRate, maxBufferSize);
+  for (size_t i = 0; i < _submodels.size(); ++i)
+  {
+    auto& model = *_submodels[i].model;
+    if (i == active_index)
+    {
+      model.Reset(sampleRate, maxBufferSize);
+    }
+    else
+    {
+      // Every tier must be prepared for the current device configuration, but
+      // prewarming inactive tiers only burns setup time and memory bandwidth.
+      ScopedPrewarmOnReset suppress_prewarm(model, false);
+      model.Reset(sampleRate, maxBufferSize);
+    }
+  }
 }
 
 size_t ContainerModel::_get_index_for_slimmable_size(const double val) const

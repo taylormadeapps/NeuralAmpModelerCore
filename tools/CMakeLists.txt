@@ -79,6 +79,13 @@ if(ENABLE_ASSERT_TEST)
 	target_compile_definitions(run_tests PRIVATE ADDASSERT)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+	find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+	foreach(NAM_TOOL_TARGET loadmodel benchmodel render benchmodel_bufsize bench_a2_fast run_tests)
+		target_link_libraries(${NAM_TOOL_TARGET} PRIVATE ${ACCELERATE_FRAMEWORK})
+	endforeach()
+endif()
+
 source_group(NAM ${CMAKE_CURRENT_SOURCE_DIR} FILES ${NAM_SOURCES})
 
 target_compile_features(${TOOLS} PUBLIC cxx_std_20)

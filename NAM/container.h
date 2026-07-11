@@ -21,6 +21,16 @@ struct Submodel
   std::unique_ptr<DSP> model;
 };
 
+struct ContainerChannelState : public ChannelState
+{
+  // External state is permanently bound to the submodel that was active when
+  // the state was created. A quality change therefore requires constructing
+  // and publishing a new set of channel states; an existing state can never be
+  // paired with a different submodel's weights.
+  size_t submodel_index = 0;
+  std::unique_ptr<ChannelState> submodel_state;
+};
+
 /// \brief A container model that holds multiple submodels at different sizes
 ///
 /// SetSlimmableSize selects the active submodel based on the max_value thresholds.
@@ -35,6 +45,13 @@ public:
   ContainerModel(std::vector<Submodel> submodels, const double expected_sample_rate);
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
+  RuntimeImplementation GetRuntimeImplementation() const override;
+  std::unique_ptr<ChannelState> createChannelState() const override;
+  void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state) override;
+  void prewarmChannelState(ChannelState& state) override;
+  void processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                            int numFrames, ChannelState** states, int numChannels) override;
+  void prepareBatch(int maxBatchSize) override;
   void prewarm() override;
   void Reset(const double sampleRate, const int maxBufferSize) override;
   void SetPrewarmOnReset(const bool prewarmOnReset) override;
@@ -48,6 +65,9 @@ private:
   std::vector<Submodel> _submodels;
   std::atomic<size_t> _active_index{0};
   std::mutex _slim_set_mutex;
+
+  DSP& _model_at(const size_t index) { return *_submodels[index].model; }
+  const DSP& _model_at(const size_t index) const { return *_submodels[index].model; }
 };
 
 // Config / registration

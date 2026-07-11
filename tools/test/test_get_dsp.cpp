@@ -221,14 +221,14 @@ public:
   {
     const std::string prefix = "DEMO::";
     if (version.rfind(prefix, 0) != 0)
-      return nam::Supported::NO;
+      return nam::Supported::UNSUPPORTED;
 
     const std::string scopedVersion = version.substr(prefix.size());
     if (scopedVersion == "1.0.0")
-      return nam::Supported::YES;
+      return nam::Supported::FULL;
     if (scopedVersion.rfind("1.0.", 0) == 0)
       return nam::Supported::PARTIAL;
-    return nam::Supported::NO;
+    return nam::Supported::UNSUPPORTED;
   }
 };
 
@@ -298,7 +298,7 @@ void test_version_too_early()
 
 void test_is_version_supported_core_behavior()
 {
-  assert(nam::is_version_supported(nam::LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION) == nam::Supported::YES);
+  assert(nam::is_version_supported(nam::LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION) == nam::Supported::FULL);
 
   nam::Version patchBeyondLatest = nam::ParseVersion(nam::LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION);
   patchBeyondLatest.patch++;
@@ -307,16 +307,16 @@ void test_is_version_supported_core_behavior()
   nam::Version minorBeyondLatest = nam::ParseVersion(nam::LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION);
   minorBeyondLatest.minor++;
   minorBeyondLatest.patch = 0;
-  assert(nam::is_version_supported(minorBeyondLatest.toString()) == nam::Supported::NO);
+  assert(nam::is_version_supported(minorBeyondLatest.toString()) == nam::Supported::UNSUPPORTED);
 }
 
 void test_register_custom_version_support_checker()
 {
   nam::register_version_support_checker(std::make_shared<DemoVersionSupportChecker>());
 
-  assert(nam::is_version_supported("DEMO::1.0.0") == nam::Supported::YES);
+  assert(nam::is_version_supported("DEMO::1.0.0") == nam::Supported::FULL);
   assert(nam::is_version_supported("DEMO::1.0.3") == nam::Supported::PARTIAL);
-  assert(nam::is_version_supported("DEMO::2.0.0") == nam::Supported::NO);
+  assert(nam::is_version_supported("DEMO::2.0.0") == nam::Supported::UNSUPPORTED);
 }
 
 void test_get_dsp_default_allows_constructor_reset_prewarm()

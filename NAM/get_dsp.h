@@ -11,9 +11,9 @@ namespace nam
 {
 enum class Supported
 {
-  NO = 0,
+  UNSUPPORTED = 0,
   PARTIAL = 1,
-  YES = 2
+  FULL = 2
 };
 
 class IVersionSupportChecker

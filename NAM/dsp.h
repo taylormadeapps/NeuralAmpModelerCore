@@ -31,6 +31,17 @@
 
 namespace nam
 {
+
+/// \brief Base class for per-channel mutable state.
+///
+/// Architecture subclasses define concrete state for recurrent buffers, ring
+/// buffers, and other mutable processing history. The DSP object keeps shared
+/// model weights; callers keep one ChannelState per audio lane.
+struct ChannelState
+{
+  virtual ~ChannelState() = default;
+};
+
 namespace wavenet
 {
 /// Forward declaration to allow WaveNet to access protected members of DSP
@@ -70,6 +81,12 @@ private:
 class DSP
 {
 public:
+  enum class RuntimeImplementation : int
+  {
+    generic = 0,
+    a2Fast = 1
+  };
+
   /// \brief Constructor
   ///
   /// \param in_channels Number of input channels
@@ -95,6 +112,39 @@ public:
   /// \param output Output audio buffers. Same structure as input.
   /// \param num_frames Number of frames to process
   virtual void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames);
+
+  /// \brief Runtime implementation selected for this concrete DSP instance.
+  ///
+  /// This is intentionally separate from the persisted architecture label: a
+  /// WaveNet-shaped model may be backed by a specialized runtime such as A2Fast.
+  virtual RuntimeImplementation GetRuntimeImplementation() const { return RuntimeImplementation::generic; }
+
+  /// \brief Create a fresh per-channel state for this model.
+  /// \return Unique pointer to a ChannelState, or nullptr if unsupported.
+  virtual std::unique_ptr<ChannelState> createChannelState() const;
+
+  /// \brief Process one channel using shared weights and external state.
+  /// \param input Input audio buffers
+  /// \param output Output audio buffers
+  /// \param num_frames Number of frames to process
+  /// \param state Per-channel state from createChannelState()
+  virtual void processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames, ChannelState& state);
+
+  /// \brief Prewarm an external channel state by processing silence.
+  /// \param state Per-channel state from createChannelState()
+  virtual void prewarmChannelState(ChannelState& state);
+
+  /// \brief Process N mono channels through shared weights.
+  ///
+  /// Default implementation is a sequential processChannel() loop. Architecture
+  /// subclasses can override with pre-allocated batch kernels.
+  virtual void processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                                    int numFrames, ChannelState** states, int numChannels);
+
+  /// \brief Pre-allocate architecture-owned batch scratch buffers.
+  /// Called off the audio thread when the lane count changes.
+  virtual void prepareBatch(int maxBatchSize);
+
   /// \brief Get the expected sample rate
   /// \return Expected sample rate in Hz (-1.0 if unknown)
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };
@@ -320,8 +370,19 @@ public:
   /// \param num_frames Number of frames to process
   void process_(const Eigen::Ref<const Eigen::MatrixXf>& input, const int num_frames);
 
+  /// \brief Process packed channel lanes into caller-owned output storage.
+  /// \param input Input matrix laid out as in_channels x (num_frames * num_channels)
+  /// \param num_frames Number of frames per lane
+  /// \param num_channels Number of packed lanes
+  /// \param output Output matrix laid out as out_channels x (num_frames * num_channels)
+  void processBatch(const Eigen::MatrixXf& input, const int num_frames, const int num_channels,
+                    Eigen::MatrixXf& output) const;
+
   long get_out_channels() const;
   long get_in_channels() const;
+
+  /// \brief Whether this pointwise convolution can use the dense packed batch kernel.
+  bool supportsDenseBatch() const { return !this->_is_depthwise && this->_num_groups == 1; }
 
 protected:
   // Non-depthwise: full weight matrix (out_channels x in_channels)

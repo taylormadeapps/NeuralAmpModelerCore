@@ -41,6 +41,19 @@ void RingBuffer::Write(const Eigen::MatrixXf& input, const int num_frames)
   _storage.middleCols(_write_pos, num_frames).noalias() = input.leftCols(num_frames);
 }
 
+void RingBuffer::WriteColumns(const Eigen::MatrixXf& input, const int column_start, const int num_frames)
+{
+  assert(num_frames <= _max_buffer_size && "WriteColumns: num_frames must not exceed max_buffer_size");
+  assert(column_start >= 0 && column_start + num_frames <= input.cols()
+         && "WriteColumns: source range must be inside input");
+  assert(input.rows() == _storage.rows() && "WriteColumns: input channel count must match ring buffer");
+
+  if (NeedsRewind(num_frames))
+    Rewind();
+
+  _storage.middleCols(_write_pos, num_frames).noalias() = input.middleCols(column_start, num_frames);
+}
+
 Eigen::Block<Eigen::MatrixXf> RingBuffer::Read(const int num_frames, const long lookback)
 {
   // Assert that lookback doesn't exceed max_lookback

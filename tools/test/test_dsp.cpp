@@ -195,10 +195,10 @@ void test_process_multi_channel()
   const int num_frames = 64;
 
   // Allocate buffers
-  std::vector<std::vector<double>> inputBuffers(in_channels);
-  std::vector<std::vector<double>> outputBuffers(out_channels);
-  std::vector<double*> inputPtrs(in_channels);
-  std::vector<double*> outputPtrs(out_channels);
+  std::vector<std::vector<NAM_SAMPLE>> inputBuffers(in_channels);
+  std::vector<std::vector<NAM_SAMPLE>> outputBuffers(out_channels);
+  std::vector<NAM_SAMPLE*> inputPtrs(in_channels);
+  std::vector<NAM_SAMPLE*> outputPtrs(out_channels);
 
   for (int ch = 0; ch < in_channels; ch++)
   {

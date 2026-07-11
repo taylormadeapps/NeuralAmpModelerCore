@@ -1,4 +1,7 @@
 #include <algorithm>
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+#include <chrono>
+#endif
 #include <cstring>
 #include <iostream>
 #include <math.h>
@@ -14,6 +17,19 @@
 
 #if defined(NAM_ENABLE_A2_FAST)
   #include "a2_fast.h"
+#endif
+
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+namespace
+{
+using WaveNetBatchProfileClock = std::chrono::steady_clock;
+
+long long elapsedProfileNs(WaveNetBatchProfileClock::time_point start,
+                           WaveNetBatchProfileClock::time_point end)
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+}
+} // namespace
 #endif
 
 // detail::Head (WaveNet post-stack head) =====================================
@@ -66,23 +82,46 @@ long nam::wavenet::detail::Head::receptive_field() const
   return rf;
 }
 
-void nam::wavenet::detail::Head::process(Eigen::MatrixXf& work, const int num_frames)
+void nam::wavenet::detail::Head::process(Eigen::MatrixXf& work, const int num_frames, HeadChannelState* state)
 {
+  assert(state == nullptr || state->conv_ring_buffers.size() == _convs.size());
+
   for (size_t i = 0; i < _convs.size(); i++)
   {
     const long in_ch = _convs[i].get_in_channels();
     if (i == 0)
     {
       _activations[i]->apply(work.data(), (long)(in_ch * num_frames));
-      _convs[i].Process(work, num_frames);
+      if (state != nullptr)
+        _convs[i].ProcessExternal(work, state->conv_ring_buffers[i], num_frames);
+      else
+        _convs[i].Process(work, num_frames);
     }
     else
     {
       auto& prev = _convs[i - 1].GetOutput();
       _activations[i]->apply(prev.data(), (long)(in_ch * num_frames));
-      _convs[i].Process(prev, num_frames);
+      if (state != nullptr)
+        _convs[i].ProcessExternal(prev, state->conv_ring_buffers[i], num_frames);
+      else
+        _convs[i].Process(prev, num_frames);
     }
   }
+}
+
+nam::wavenet::detail::HeadChannelState nam::wavenet::detail::Head::createChannelState() const
+{
+  HeadChannelState state;
+  state.conv_ring_buffers.reserve(_convs.size());
+  for (const auto& conv : _convs)
+    state.conv_ring_buffers.push_back(conv.createFreshRingBuffer());
+  return state;
+}
+
+void nam::wavenet::detail::Head::swapChannelState(HeadChannelState& state)
+{
+  for (size_t i = 0; i < _convs.size(); i++)
+    _convs[i].swapRingBuffer(state.conv_ring_buffers[i]);
 }
 
 // Layer ======================================================================
@@ -163,21 +202,113 @@ void nam::wavenet::detail::Layer::set_weights_(std::vector<float>::iterator& wei
     this->_head1x1_post_film->set_weights_(weights);
 }
 
+void nam::wavenet::detail::Layer::PrepareBatch(const int maxBufferSize, const int maxBatchSize)
+{
+  const int maxPackedCols = maxBufferSize * maxBatchSize;
+  if (maxPackedCols <= 0)
+    return;
+
+  this->_batch_conv_output.resize(this->_conv.get_out_channels(), maxPackedCols);
+  this->_batch_input_mixin_output.resize(this->_input_mixin.get_out_channels(), maxPackedCols);
+  this->_batch_z.resize(this->_conv.get_out_channels(), maxPackedCols);
+  this->_batch_output_next_layer.resize(this->get_channels(), maxPackedCols);
+  this->_batch_conv_input_scratch.resize(this->_conv.get_in_channels(), maxPackedCols);
+
+  if (this->_layer1x1)
+    this->_batch_layer1x1_output.resize(this->_layer1x1->get_out_channels(), maxPackedCols);
+
+  if (this->_head1x1)
+    this->_batch_output_head.resize(this->_head1x1->get_out_channels(), maxPackedCols);
+  else
+    this->_batch_output_head.resize(this->_bottleneck, maxPackedCols);
+}
+
+bool nam::wavenet::detail::Layer::supportsDenseBatch() const
+{
+  return this->_gating_mode == GatingMode::NONE
+         && this->_skip_head_copy
+         && this->_layer1x1 != nullptr
+         && this->_head1x1 == nullptr
+         && this->_conv_pre_film == nullptr
+         && this->_conv_post_film == nullptr
+         && this->_input_mixin_pre_film == nullptr
+         && this->_input_mixin_post_film == nullptr
+         && this->_activation_pre_film == nullptr
+         && this->_activation_post_film == nullptr
+         && this->_layer1x1_post_film == nullptr
+         && this->_head1x1_post_film == nullptr
+         && this->_conv.supportsDenseBatch()
+         && this->_input_mixin.supportsDenseBatch()
+         && this->_layer1x1->supportsDenseBatch();
+}
+
+void nam::wavenet::detail::Layer::ProcessBatch(const Eigen::MatrixXf& packed_input,
+                                               const Eigen::MatrixXf& packed_condition,
+                                               RingBuffer* const* conv_ring_buffers,
+                                               const int num_frames, const int num_channels)
+{
+  assert(supportsDenseBatch());
+  const int packedCols = num_frames * num_channels;
+
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  BatchProfileDebugInfo profile;
+  auto sectionStart = WaveNetBatchProfileClock::now();
+#endif
+  this->_conv.ProcessBatchExternal(
+    packed_input, conv_ring_buffers, num_frames, num_channels, this->_batch_conv_output, this->_batch_conv_input_scratch);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.convNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  sectionStart = WaveNetBatchProfileClock::now();
+#endif
+  this->_input_mixin.processBatch(packed_condition, num_frames, num_channels, this->_batch_input_mixin_output);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.inputMixinNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  sectionStart = WaveNetBatchProfileClock::now();
+#endif
+
+  this->_batch_z.leftCols(packedCols).noalias() =
+    this->_batch_conv_output.leftCols(packedCols) + this->_batch_input_mixin_output.leftCols(packedCols);
+  this->_activation->apply(this->_batch_z.leftCols(packedCols));
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.sumActivationNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  sectionStart = WaveNetBatchProfileClock::now();
+#endif
+
+  this->_layer1x1->processBatch(this->_batch_z, num_frames, num_channels, this->_batch_layer1x1_output);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.layer1x1Ns = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  sectionStart = WaveNetBatchProfileClock::now();
+#endif
+  this->_batch_output_next_layer.leftCols(packedCols).noalias() =
+    packed_input.leftCols(packedCols) + this->_batch_layer1x1_output.leftCols(packedCols);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.residualNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  this->_lastBatchProfileDebugInfo = profile;
+#endif
+}
+
 void nam::wavenet::detail::Layer::Process(const Eigen::MatrixXf& input, const Eigen::MatrixXf& condition,
-                                          const int num_frames)
+                                          const int num_frames, LayerChannelState* state)
 {
   const long bottleneck = this->_bottleneck; // Use the actual bottleneck value, not the doubled output channels
+  auto processConv = [this, state, num_frames](const Eigen::MatrixXf& conv_input)
+  {
+    if (state != nullptr)
+      this->_conv.ProcessExternal(conv_input, state->conv_ring_buffer, num_frames);
+    else
+      this->_conv.Process(conv_input, num_frames);
+  };
 
   // Step 1: input convolutions
   if (this->_conv_pre_film)
   {
     // Use Process() instead of Process_() since input is const
     this->_conv_pre_film->Process(input, condition, num_frames);
-    this->_conv.Process(this->_conv_pre_film->GetOutput(), num_frames);
+    processConv(this->_conv_pre_film->GetOutput());
   }
   else
   {
-    this->_conv.Process(input, num_frames);
+    processConv(input);
   }
   if (this->_conv_post_film)
   {
@@ -375,6 +506,18 @@ void nam::wavenet::detail::Layer::Process(const Eigen::MatrixXf& input, const Ei
   }
 }
 
+nam::wavenet::detail::LayerChannelState nam::wavenet::detail::Layer::createChannelState() const
+{
+  LayerChannelState state;
+  state.conv_ring_buffer = _conv.createFreshRingBuffer();
+  return state;
+}
+
+void nam::wavenet::detail::Layer::swapChannelState(LayerChannelState& state)
+{
+  _conv.swapRingBuffer(state.conv_ring_buffer);
+}
+
 // LayerArray =================================================================
 
 nam::wavenet::detail::LayerArray::LayerArray(const LayerArrayParams& params)
@@ -413,6 +556,34 @@ void nam::wavenet::detail::LayerArray::SetMaxBufferSize(const int maxBufferSize)
   this->_head_inputs.resize(this->_head_output_size, maxBufferSize);
 }
 
+void nam::wavenet::detail::LayerArray::PrepareBatch(const int maxBufferSize, const int maxBatchSize)
+{
+  const int maxPackedCols = maxBufferSize * maxBatchSize;
+  if (maxPackedCols <= 0)
+    return;
+
+  for (auto& layer : this->_layers)
+    layer.PrepareBatch(maxBufferSize, maxBatchSize);
+
+  this->_batch_layer_outputs.resize(this->_get_channels(), maxPackedCols);
+  this->_batch_head_inputs.resize(this->_head_output_size, maxPackedCols);
+  this->_batch_head_outputs.resize(this->_head_rechannel.get_out_channels(), maxPackedCols);
+  this->_batch_head_rechannel_input_scratch.resize(this->_head_rechannel.get_in_channels(), maxPackedCols);
+  this->_batch_ring_buffer_ptrs.resize(maxBatchSize);
+}
+
+bool nam::wavenet::detail::LayerArray::supportsDenseBatch() const
+{
+  if (!this->_rechannel.supportsDenseBatch() || !this->_head_rechannel.supportsDenseBatch())
+    return false;
+
+  for (const auto& layer : this->_layers)
+    if (!layer.supportsDenseBatch())
+      return false;
+
+  return true;
+}
+
 
 long nam::wavenet::detail::LayerArray::get_receptive_field() const
 {
@@ -423,17 +594,35 @@ long nam::wavenet::detail::LayerArray::get_receptive_field() const
   return result;
 }
 
+nam::wavenet::detail::LayerArrayChannelState nam::wavenet::detail::LayerArray::createChannelState() const
+{
+  LayerArrayChannelState state;
+  state.layers.reserve(_layers.size());
+  for (const auto& layer : _layers)
+    state.layers.push_back(layer.createChannelState());
+  state.head_rechannel_ring_buffer = _head_rechannel.createFreshRingBuffer();
+  return state;
+}
+
+void nam::wavenet::detail::LayerArray::swapChannelState(LayerArrayChannelState& state)
+{
+  for (size_t i = 0; i < _layers.size(); i++)
+    _layers[i].swapChannelState(state.layers[i]);
+  _head_rechannel.swapRingBuffer(state.head_rechannel_ring_buffer);
+}
+
 
 void nam::wavenet::detail::LayerArray::Process(const Eigen::MatrixXf& layer_inputs, const Eigen::MatrixXf& condition,
-                                               const int num_frames)
+                                               const int num_frames, LayerArrayChannelState* state)
 {
   // Zero head inputs accumulator (first layer array)
   this->_head_inputs.setZero();
-  ProcessInner(layer_inputs, condition, num_frames);
+  ProcessInner(layer_inputs, condition, num_frames, state);
 }
 
 void nam::wavenet::detail::LayerArray::Process(const Eigen::MatrixXf& layer_inputs, const Eigen::MatrixXf& condition,
-                                               const Eigen::MatrixXf& head_inputs, const int num_frames)
+                                               const Eigen::MatrixXf& head_inputs, const int num_frames,
+                                               LayerArrayChannelState* state)
 {
   // Copy head inputs from previous layer array - use memcpy for pure copy
 #ifdef NAM_USE_INLINE_GEMM
@@ -444,12 +633,56 @@ void nam::wavenet::detail::LayerArray::Process(const Eigen::MatrixXf& layer_inpu
 #else
   this->_head_inputs.leftCols(num_frames).noalias() = head_inputs.leftCols(num_frames);
 #endif
-  ProcessInner(layer_inputs, condition, num_frames);
+  ProcessInner(layer_inputs, condition, num_frames, state);
+}
+
+void nam::wavenet::detail::LayerArray::ProcessBatch(const Eigen::MatrixXf& packed_layer_inputs,
+                                                    const Eigen::MatrixXf& packed_condition,
+                                                    LayerArrayChannelState** states,
+                                                    const int num_frames, const int num_channels)
+{
+  const int packedCols = num_frames * num_channels;
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  const auto headInputStart = WaveNetBatchProfileClock::now();
+#endif
+  this->_batch_head_inputs.leftCols(packedCols).setZero();
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  const auto headInputNs = elapsedProfileNs(headInputStart, WaveNetBatchProfileClock::now());
+#endif
+  ProcessBatchInner(packed_layer_inputs, packed_condition, states, num_frames, num_channels);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  this->_lastBatchProfileDebugInfo.headInputSetupNs = headInputNs;
+  this->_lastBatchProfileDebugInfo.totalNs += headInputNs;
+#endif
+}
+
+void nam::wavenet::detail::LayerArray::ProcessBatch(const Eigen::MatrixXf& packed_layer_inputs,
+                                                    const Eigen::MatrixXf& packed_condition,
+                                                    const Eigen::MatrixXf& packed_head_inputs,
+                                                    LayerArrayChannelState** states,
+                                                    const int num_frames, const int num_channels)
+{
+  const int packedCols = num_frames * num_channels;
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  const auto headInputStart = WaveNetBatchProfileClock::now();
+#endif
+  this->_batch_head_inputs.leftCols(packedCols).noalias() = packed_head_inputs.leftCols(packedCols);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  const auto headInputNs = elapsedProfileNs(headInputStart, WaveNetBatchProfileClock::now());
+#endif
+  ProcessBatchInner(packed_layer_inputs, packed_condition, states, num_frames, num_channels);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  this->_lastBatchProfileDebugInfo.headInputSetupNs = headInputNs;
+  this->_lastBatchProfileDebugInfo.totalNs += headInputNs;
+#endif
 }
 
 void nam::wavenet::detail::LayerArray::ProcessInner(const Eigen::MatrixXf& layer_inputs,
-                                                    const Eigen::MatrixXf& condition, const int num_frames)
+                                                    const Eigen::MatrixXf& condition, const int num_frames,
+                                                    LayerArrayChannelState* state)
 {
+  assert(state == nullptr || state->layers.size() == this->_layers.size());
+
   // Process rechannel and get output
   this->_rechannel.process_(layer_inputs, num_frames);
   Eigen::MatrixXf& rechannel_output = _rechannel.GetOutput();
@@ -462,13 +695,14 @@ void nam::wavenet::detail::LayerArray::ProcessInner(const Eigen::MatrixXf& layer
     if (i == 0)
     {
       // First layer consumes the rechannel output buffer
-      this->_layers[i].Process(rechannel_output, condition, num_frames);
+      this->_layers[i].Process(
+        rechannel_output, condition, num_frames, state != nullptr ? &state->layers[i] : nullptr);
     }
     else
     {
       // Subsequent layers consume the full output buffer of the previous layer
       Eigen::MatrixXf& prev_output = this->_layers[i - 1].GetOutputNextLayer();
-      this->_layers[i].Process(prev_output, condition, num_frames);
+      this->_layers[i].Process(prev_output, condition, num_frames, state != nullptr ? &state->layers[i] : nullptr);
     }
 
     // Accumulate head output from this layer
@@ -507,7 +741,95 @@ void nam::wavenet::detail::LayerArray::ProcessInner(const Eigen::MatrixXf& layer
 #endif
 
   // Process head rechannel (causal Conv1D)
-  _head_rechannel.Process(this->_head_inputs, num_frames);
+  if (state != nullptr)
+    _head_rechannel.ProcessExternal(this->_head_inputs, state->head_rechannel_ring_buffer, num_frames);
+  else
+    _head_rechannel.Process(this->_head_inputs, num_frames);
+}
+
+void nam::wavenet::detail::LayerArray::ProcessBatchInner(const Eigen::MatrixXf& packed_layer_inputs,
+                                                         const Eigen::MatrixXf& packed_condition,
+                                                         LayerArrayChannelState** states,
+                                                         const int num_frames, const int num_channels)
+{
+  assert(supportsDenseBatch());
+  assert(num_channels <= (int)this->_batch_ring_buffer_ptrs.size());
+  const int packedCols = num_frames * num_channels;
+
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  BatchProfileDebugInfo profile;
+  profile.layerCount = (int)this->_layers.size();
+  const auto profileStart = WaveNetBatchProfileClock::now();
+  auto sectionStart = profileStart;
+#endif
+  this->_rechannel.processBatch(packed_layer_inputs, num_frames, num_channels, this->_batch_layer_outputs);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.rechannelNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+#endif
+
+  for (size_t i = 0; i < this->_layers.size(); ++i)
+  {
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    sectionStart = WaveNetBatchProfileClock::now();
+#endif
+    for (int ch = 0; ch < num_channels; ++ch)
+      this->_batch_ring_buffer_ptrs[(size_t)ch] = &states[ch]->layers[i].conv_ring_buffer;
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    profile.layerStatePtrNs += elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+#endif
+
+    Eigen::MatrixXf& layerInput = i == 0
+      ? this->_batch_layer_outputs
+      : this->_layers[i - 1].GetBatchOutputNextLayer();
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    sectionStart = WaveNetBatchProfileClock::now();
+#endif
+    this->_layers[i].ProcessBatch(
+      layerInput, packed_condition, this->_batch_ring_buffer_ptrs.data(), num_frames, num_channels);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    profile.layerProcessNs += elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+    const auto layerProfile = this->_layers[i].getLastBatchProfileDebugInfo();
+    profile.layerConvNs += layerProfile.convNs;
+    profile.layerInputMixinNs += layerProfile.inputMixinNs;
+    profile.layerSumActivationNs += layerProfile.sumActivationNs;
+    profile.layer1x1Ns += layerProfile.layer1x1Ns;
+    profile.layerResidualNs += layerProfile.residualNs;
+    sectionStart = WaveNetBatchProfileClock::now();
+#endif
+
+    this->_batch_head_inputs.leftCols(packedCols).noalias() +=
+      this->_layers[i].GetBatchOutputHead().leftCols(packedCols);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    profile.headAccumNs += elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+#endif
+  }
+
+  const size_t last_layer = this->_layers.size() - 1;
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  sectionStart = WaveNetBatchProfileClock::now();
+#endif
+  this->_batch_layer_outputs.leftCols(packedCols).noalias() =
+    this->_layers[last_layer].GetBatchOutputNextLayer().leftCols(packedCols);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.layerOutputCopyNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  sectionStart = WaveNetBatchProfileClock::now();
+#endif
+
+  for (int ch = 0; ch < num_channels; ++ch)
+    this->_batch_ring_buffer_ptrs[(size_t)ch] = &states[ch]->head_rechannel_ring_buffer;
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.headStatePtrNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  sectionStart = WaveNetBatchProfileClock::now();
+#endif
+
+  this->_head_rechannel.ProcessBatchExternal(this->_batch_head_inputs, this->_batch_ring_buffer_ptrs.data(),
+                                             num_frames, num_channels, this->_batch_head_outputs,
+                                             this->_batch_head_rechannel_input_scratch);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.headRechannelNs = elapsedProfileNs(sectionStart, WaveNetBatchProfileClock::now());
+  profile.totalNs = elapsedProfileNs(profileStart, WaveNetBatchProfileClock::now());
+  this->_lastBatchProfileDebugInfo = profile;
+#endif
 }
 
 
@@ -687,6 +1009,65 @@ void nam::wavenet::WaveNet::SetMaxBufferSize(const int maxBufferSize)
     this->_post_stack_head->SetMaxBufferSize(maxBufferSize);
     this->_scaled_head_scratch.resize(this->_post_stack_head->in_channels(), maxBufferSize);
   }
+
+  resizeBatchScratch();
+}
+
+void nam::wavenet::WaveNet::prepareBatch(int maxBatchSize)
+{
+  this->_max_batch_size = std::max(0, maxBatchSize);
+  resizeBatchScratch();
+}
+
+bool nam::wavenet::WaveNet::supportsDenseBatch() const
+{
+  if (this->_condition_dsp != nullptr || this->_post_stack_head != nullptr)
+    return false;
+  if (NumInputChannels() != 1 || NumOutputChannels() != 1 || this->_layer_arrays.empty())
+    return false;
+  for (const auto& layerArray : this->_layer_arrays)
+    if (!layerArray.supportsDenseBatch())
+      return false;
+  return true;
+}
+
+void nam::wavenet::WaveNet::resizeBatchScratch()
+{
+  if (this->_max_batch_size <= 0 || this->mMaxBufferSize <= 0)
+    return;
+  const int maxPackedCols = this->mMaxBufferSize * this->_max_batch_size;
+  this->_batch_condition_input.resize(this->_get_condition_dim(), maxPackedCols);
+  this->_batch_condition_output.resize(this->_condition_output.rows(), maxPackedCols);
+  this->_batch_state_ptrs.resize(this->_max_batch_size);
+  this->_batch_layer_array_state_ptrs.resize(this->_max_batch_size);
+  for (auto& layerArray : this->_layer_arrays)
+    layerArray.PrepareBatch(this->mMaxBufferSize, this->_max_batch_size);
+}
+
+std::unique_ptr<nam::ChannelState> nam::wavenet::WaveNet::createChannelState() const
+{
+  auto state = std::make_unique<WaveNetChannelState>();
+  if (this->_condition_dsp != nullptr)
+  {
+    auto condition_state = this->_condition_dsp->createChannelState();
+    if (condition_state == nullptr)
+      return nullptr;
+    state->condition_state = std::move(condition_state);
+  }
+  state->layer_arrays.reserve(this->_layer_arrays.size());
+  for (const auto& layer_array : this->_layer_arrays)
+    state->layer_arrays.push_back(layer_array.createChannelState());
+  if (this->_post_stack_head != nullptr)
+    state->post_stack_head = std::make_unique<detail::HeadChannelState>(this->_post_stack_head->createChannelState());
+  return state;
+}
+
+void nam::wavenet::WaveNet::swapChannelState(WaveNetChannelState& state)
+{
+  for (size_t i = 0; i < this->_layer_arrays.size(); i++)
+    this->_layer_arrays[i].swapChannelState(state.layer_arrays[i]);
+  if (this->_post_stack_head != nullptr && state.post_stack_head != nullptr)
+    this->_post_stack_head->swapChannelState(*state.post_stack_head);
 }
 
 void nam::wavenet::WaveNet::SetPrewarmOnReset(const bool prewarmOnReset)
@@ -697,6 +1078,11 @@ void nam::wavenet::WaveNet::SetPrewarmOnReset(const bool prewarmOnReset)
 }
 
 void nam::wavenet::WaveNet::_process_condition(const int num_frames)
+{
+  _process_condition(num_frames, nullptr);
+}
+
+void nam::wavenet::WaveNet::_process_condition(const int num_frames, ChannelState* condition_state)
 {
   if (this->_condition_dsp == nullptr)
   {
@@ -715,8 +1101,16 @@ void nam::wavenet::WaveNet::_process_condition(const int num_frames)
     }
 
     // Process through condition DSP using pre-allocated buffers
-    this->_condition_dsp->process(
-      this->_condition_dsp_input_ptrs.data(), this->_condition_dsp_output_ptrs.data(), num_frames);
+    if (condition_state != nullptr)
+    {
+      this->_condition_dsp->processChannel(
+        this->_condition_dsp_input_ptrs.data(), this->_condition_dsp_output_ptrs.data(), num_frames, *condition_state);
+    }
+    else
+    {
+      this->_condition_dsp->process(
+        this->_condition_dsp_input_ptrs.data(), this->_condition_dsp_output_ptrs.data(), num_frames);
+    }
 
     // Copy output data back to Eigen matrix
     const int condition_output_channels = this->_condition_dsp->NumOutputChannels();
@@ -743,11 +1137,26 @@ void nam::wavenet::WaveNet::_set_condition_array(NAM_SAMPLE** input, const int n
 
 void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames)
 {
+  processInternal(input, output, num_frames, nullptr);
+}
+
+void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                    WaveNetChannelState& state)
+{
+  processInternal(input, output, num_frames, &state);
+}
+
+void nam::wavenet::WaveNet::processInternal(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                            WaveNetChannelState* state)
+{
   assert(num_frames <= mMaxBufferSize);
+  assert(state == nullptr || state->layer_arrays.size() == this->_layer_arrays.size());
+  assert(state == nullptr || this->_condition_dsp == nullptr || state->condition_state != nullptr);
+
   const int out_channels = NumOutputChannels();
 
   this->_set_condition_array(input, num_frames);
-  this->_process_condition(num_frames);
+  this->_process_condition(num_frames, state != nullptr ? state->condition_state.get() : nullptr);
 
   // Main layer arrays:
   // Layer-to-layer
@@ -758,7 +1167,8 @@ void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
       // First layer array - no head input
       // layer_inputs should be the original input (before condition_dsp processing),
       // condition should be the processed condition output (after condition_dsp)
-      this->_layer_arrays[i].Process(this->_condition_input, this->_condition_output, num_frames);
+      this->_layer_arrays[i].Process(this->_condition_input, this->_condition_output, num_frames,
+                                     state != nullptr ? &state->layer_arrays[i] : nullptr);
     }
     else
     {
@@ -767,7 +1177,8 @@ void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
       // across API boundaries (which can cause Eigen to allocate temporaries).
       Eigen::MatrixXf& prev_layer_outputs = this->_layer_arrays[i - 1].GetLayerOutputs();
       Eigen::MatrixXf& prev_head_outputs = this->_layer_arrays[i - 1].GetHeadOutputs();
-      this->_layer_arrays[i].Process(prev_layer_outputs, this->_condition_output, prev_head_outputs, num_frames);
+      this->_layer_arrays[i].Process(prev_layer_outputs, this->_condition_output, prev_head_outputs, num_frames,
+                                     state != nullptr ? &state->layer_arrays[i] : nullptr);
     }
   }
 
@@ -782,7 +1193,8 @@ void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
       for (int s = 0; s < num_frames; s++)
         this->_scaled_head_scratch(ch, s) = this->_head_scale * final_head_outputs(ch, s);
     }
-    this->_post_stack_head->process(this->_scaled_head_scratch, num_frames);
+    this->_post_stack_head->process(
+      this->_scaled_head_scratch, num_frames, state != nullptr ? state->post_stack_head.get() : nullptr);
     const Eigen::MatrixXf& head_out = this->_post_stack_head->get_last_output();
     assert(head_out.rows() == out_channels);
 
@@ -828,6 +1240,198 @@ void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
         output[ch][s] = this->_head_scale * final_head_outputs(ch, s);
       }
     }
+  }
+}
+
+void nam::wavenet::WaveNet::processChannel(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames,
+                                           ChannelState& state)
+{
+  auto& waveNetState = static_cast<WaveNetChannelState&>(state);
+  process(input, output, num_frames, waveNetState);
+}
+
+void nam::wavenet::WaveNet::processBatchChannels(NAM_SAMPLE* const* monoInputs, NAM_SAMPLE* const* monoOutputs,
+                                                 int numFrames, ChannelState** states, int numChannels)
+{
+  if (numChannels <= 0)
+    return;
+
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  BatchProfileDebugInfo profile;
+  profile.numFrames = numFrames;
+  profile.numChannels = numChannels;
+  profile.layerArrayCount = (int)this->_layer_arrays.size();
+  const auto profileStart = WaveNetBatchProfileClock::now();
+#endif
+
+  setLastBatchKernelDebugInfo(BatchKernelMode::inactive, BatchKernelFallbackReason::none, numChannels);
+
+#if !defined(NAM_ENABLE_WAVENET_DENSE_BATCH)
+  setLastBatchKernelDebugInfo(
+    BatchKernelMode::directSequential, BatchKernelFallbackReason::denseBatchDisabled, numChannels);
+  DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+  return;
+#else
+  if (numChannels < kDenseBatchMinChannels)
+  {
+    setLastBatchKernelDebugInfo(
+      BatchKernelMode::directSequential, BatchKernelFallbackReason::belowDenseThreshold, numChannels);
+    DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+    return;
+  }
+
+  if (!supportsDenseBatch())
+  {
+    setLastBatchKernelDebugInfo(
+      BatchKernelMode::directSequential, BatchKernelFallbackReason::unsupportedShape, numChannels);
+    DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+    return;
+  }
+
+  if (this->_max_batch_size < numChannels
+      || this->_batch_state_ptrs.size() < (size_t)numChannels
+      || this->_batch_condition_input.cols() < numFrames * numChannels)
+  {
+    setLastBatchKernelDebugInfo(
+      BatchKernelMode::directSequential, BatchKernelFallbackReason::batchScratchTooSmall, numChannels);
+    DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+    return;
+  }
+
+  for (int ch = 0; ch < numChannels; ++ch)
+  {
+    if (monoInputs[ch] == nullptr || monoOutputs[ch] == nullptr || states[ch] == nullptr)
+    {
+      setLastBatchKernelDebugInfo(
+        BatchKernelMode::directSequential, BatchKernelFallbackReason::invalidState, numChannels);
+      DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+      return;
+    }
+
+    auto* waveNetState = dynamic_cast<WaveNetChannelState*>(states[ch]);
+    if (waveNetState == nullptr || waveNetState->layer_arrays.size() != this->_layer_arrays.size())
+    {
+      setLastBatchKernelDebugInfo(
+        BatchKernelMode::directSequential, BatchKernelFallbackReason::invalidState, numChannels);
+      DSP::processBatchChannels(monoInputs, monoOutputs, numFrames, states, numChannels);
+      return;
+    }
+
+    this->_batch_state_ptrs[(size_t)ch] = waveNetState;
+    for (int s = 0; s < numFrames; ++s)
+      this->_batch_condition_input(0, ch * numFrames + s) = monoInputs[ch][s];
+  }
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.inputPackNs = elapsedProfileNs(profileStart, WaveNetBatchProfileClock::now());
+#endif
+
+  const int packedCols = numFrames * numChannels;
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  const auto conditionCopyStart = WaveNetBatchProfileClock::now();
+#endif
+  this->_batch_condition_output.leftCols(packedCols).noalias() =
+    this->_batch_condition_input.leftCols(packedCols);
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.conditionCopyNs = elapsedProfileNs(conditionCopyStart, WaveNetBatchProfileClock::now());
+#endif
+
+  for (size_t i = 0; i < this->_layer_arrays.size(); ++i)
+  {
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    const auto layerStateStart = WaveNetBatchProfileClock::now();
+#endif
+    for (int ch = 0; ch < numChannels; ++ch)
+      this->_batch_layer_array_state_ptrs[(size_t)ch] = &this->_batch_state_ptrs[(size_t)ch]->layer_arrays[i];
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    profile.layerStatePtrNs += elapsedProfileNs(layerStateStart, WaveNetBatchProfileClock::now());
+    const auto layerProcessStart = WaveNetBatchProfileClock::now();
+#endif
+
+    if (i == 0)
+    {
+      this->_layer_arrays[i].ProcessBatch(this->_batch_condition_input, this->_batch_condition_output,
+                                          this->_batch_layer_array_state_ptrs.data(), numFrames, numChannels);
+    }
+    else
+    {
+      this->_layer_arrays[i].ProcessBatch(this->_layer_arrays[i - 1].GetBatchLayerOutputs(),
+                                          this->_batch_condition_output,
+                                          this->_layer_arrays[i - 1].GetBatchHeadOutputs(),
+                                          this->_batch_layer_array_state_ptrs.data(), numFrames, numChannels);
+    }
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+    profile.layerProcessNs += elapsedProfileNs(layerProcessStart, WaveNetBatchProfileClock::now());
+    const auto layerProfile = this->_layer_arrays[i].getLastBatchProfileDebugInfo();
+    profile.layerCount += layerProfile.layerCount;
+    profile.layerArrayHeadInputSetupNs += layerProfile.headInputSetupNs;
+    profile.layerArrayRechannelNs += layerProfile.rechannelNs;
+    profile.layerArrayLayerStatePtrNs += layerProfile.layerStatePtrNs;
+    profile.layerArrayLayerProcessNs += layerProfile.layerProcessNs;
+    profile.layerArrayHeadAccumNs += layerProfile.headAccumNs;
+    profile.layerArrayOutputCopyNs += layerProfile.layerOutputCopyNs;
+    profile.layerArrayHeadStatePtrNs += layerProfile.headStatePtrNs;
+    profile.layerArrayHeadRechannelNs += layerProfile.headRechannelNs;
+    profile.layerConvNs += layerProfile.layerConvNs;
+    profile.layerInputMixinNs += layerProfile.layerInputMixinNs;
+    profile.layerSumActivationNs += layerProfile.layerSumActivationNs;
+    profile.layer1x1Ns += layerProfile.layer1x1Ns;
+    profile.layerResidualNs += layerProfile.layerResidualNs;
+#endif
+  }
+
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  const auto outputScatterStart = WaveNetBatchProfileClock::now();
+#endif
+  Eigen::MatrixXf& finalHeadOutputs = this->_layer_arrays.back().GetBatchHeadOutputs();
+  for (int ch = 0; ch < numChannels; ++ch)
+  {
+    const int offset = ch * numFrames;
+    for (int s = 0; s < numFrames; ++s)
+      monoOutputs[ch][s] = this->_head_scale * finalHeadOutputs(0, offset + s);
+  }
+#if defined(NAM_WAVENET_BATCH_PROFILE)
+  profile.outputScatterNs = elapsedProfileNs(outputScatterStart, WaveNetBatchProfileClock::now());
+  profile.totalNs = elapsedProfileNs(profileStart, WaveNetBatchProfileClock::now());
+  this->_lastBatchProfileDebugInfo = profile;
+#endif
+
+  setLastBatchKernelDebugInfo(BatchKernelMode::denseBatch, BatchKernelFallbackReason::none, numChannels);
+#endif
+}
+
+void nam::wavenet::WaveNet::prewarmChannelState(ChannelState& state)
+{
+  if (mMaxBufferSize == 0)
+    SetMaxBufferSize(NAM_DEFAULT_MAX_BUFFER_SIZE);
+
+  const int prewarmSamples = GetPrewarmSamples();
+  if (prewarmSamples == 0)
+    return;
+
+  auto& waveNetState = static_cast<WaveNetChannelState&>(state);
+  const int bufferSize = std::max(mMaxBufferSize, 1);
+  std::vector<std::vector<NAM_SAMPLE>> inputBuffers(NumInputChannels());
+  std::vector<std::vector<NAM_SAMPLE>> outputBuffers(NumOutputChannels());
+  std::vector<NAM_SAMPLE*> inputPtrs(NumInputChannels());
+  std::vector<NAM_SAMPLE*> outputPtrs(NumOutputChannels());
+
+  for (int ch = 0; ch < NumInputChannels(); ch++)
+  {
+    inputBuffers[ch].resize(bufferSize, (NAM_SAMPLE)0.0);
+    inputPtrs[ch] = inputBuffers[ch].data();
+  }
+  for (int ch = 0; ch < NumOutputChannels(); ch++)
+  {
+    outputBuffers[ch].resize(bufferSize, (NAM_SAMPLE)0.0);
+    outputPtrs[ch] = outputBuffers[ch].data();
+  }
+
+  int samplesProcessed = 0;
+  while (samplesProcessed < prewarmSamples)
+  {
+    const int blockSize = std::min(bufferSize, prewarmSamples - samplesProcessed);
+    process(inputPtrs.data(), outputPtrs.data(), blockSize, waveNetState);
+    samplesProcessed += blockSize;
   }
 }
 

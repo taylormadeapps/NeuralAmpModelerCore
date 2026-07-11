@@ -14,6 +14,16 @@ namespace test_wavenet
 {
 namespace test_condition_processing
 {
+
+class UnsupportedExternalStateDSP : public nam::DSP
+{
+public:
+  explicit UnsupportedExternalStateDSP(const int channels)
+  : DSP(channels, channels, 48000.0)
+  {
+  }
+};
+
 // Helper function to create default (inactive) FiLM parameters
 static nam::wavenet::_FiLMParams make_default_film_params()
 {
@@ -44,7 +54,7 @@ static nam::wavenet::LayerArrayParams make_layer_array_params(
 
 // Helper function to create a simple WaveNet with specified input and output channels
 std::unique_ptr<nam::wavenet::WaveNet> create_simple_wavenet(
-  const int in_channels, const int out_channels, std::unique_ptr<nam::wavenet::WaveNet> condition_dsp = nullptr)
+  const int in_channels, const int out_channels, std::unique_ptr<nam::DSP> condition_dsp = nullptr)
 {
   const float head_scale = 1.0f;
   // Create a simple single-layer configuration
@@ -158,6 +168,7 @@ void test_with_condition_dsp()
   const int numFrames = 8;
   const int maxBufferSize = 64;
   wavenet->Reset(48000.0, maxBufferSize);
+  assert(wavenet->createChannelState() != nullptr);
 
   // Create input with known values
   std::vector<NAM_SAMPLE> input(numFrames);
@@ -177,6 +188,17 @@ void test_with_condition_dsp()
   {
     assert(std::isfinite(output[i]));
   }
+}
+
+void test_condition_dsp_external_state_is_all_or_nothing()
+{
+  auto condition_dsp = std::make_unique<UnsupportedExternalStateDSP>(1);
+  auto wavenet = create_simple_wavenet(1, 1, std::move(condition_dsp));
+  wavenet->Reset(48000.0, 64);
+
+  // The outer WaveNet must not advertise shared external state when a required
+  // nested DSP would retain mutable history inside the shared model instance.
+  assert(wavenet->createChannelState() == nullptr);
 }
 
 // Test with multiple input channels
